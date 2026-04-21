@@ -1,3 +1,6 @@
 streamlit
 anthropic
 PyMuPDF
+requests
+beautifulsoup4
+ 
