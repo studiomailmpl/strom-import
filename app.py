@@ -1,11 +1,12 @@
 import streamlit as st
 import json
-import csv
 import math
 import fitz  # pymupdf
 import anthropic
+import requests
 import re
-from io import BytesIO, StringIO
+from io import BytesIO
+from shopify_api import ShopifyGraphQL
 
 # ─── Page Config ───
 st.set_page_config(
@@ -14,22 +15,73 @@ st.set_page_config(
     layout="wide",
 )
 
-# ─── Secrets / Config ───
+# ─── Secrets ───
 ANTHROPIC_API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
+SHOPIFY_STORE = st.secrets.get("SHOPIFY_STORE", "stroemstore")
+SHOPIFY_ACCESS_TOKEN = st.secrets.get("SHOPIFY_ACCESS_TOKEN", "")
 
-# ─── EUR→DKK rate (approximate) ───
+# ─── Constants ───
 EUR_TO_DKK = 7.46
 
-# ─── Session State Init ───
-if "products" not in st.session_state:
-    st.session_state.products = []
-if "step" not in st.session_state:
-    st.session_state.step = "upload"
-if "csv_data" not in st.session_state:
-    st.session_state.csv_data = None
+# Danish product type mapping
+TYPE_MAP_DA = {
+    "trouser": "Bukser", "pants": "Bukser", "pantalon": "Bukser",
+    "trousers": "Bukser", "shorts": "Shorts", "short": "Shorts",
+    "bermuda": "Shorts", "shirt": "Skjorter", "chemise": "Skjorter",
+    "t-shirt": "T-Shirts", "tee": "T-Shirts", "knit": "Strik",
+    "knitwear": "Strik", "pull": "Strik", "pullover": "Strik",
+    "sweater": "Strik", "cardigan": "Strik", "jacket": "Jakker",
+    "coat": "Jakker", "blazer": "Blazere", "dress": "Kjoler",
+    "skirt": "Nederdele", "top": "Toppe", "blouse": "Bluser",
+    "hoodie": "Hoodies", "sweatshirt": "Sweatshirts",
+    "vest": "Veste", "polo": "Poloer",
+    # Shoes
+    "sneaker": "Sneakers", "sneakers": "Sneakers",
+    "sandal": "Sandaler", "sandals": "Sandaler",
+    "boot": "Støvler", "boots": "Støvler",
+    "loafer": "Loafers", "loafers": "Loafers",
+    "shoe": "Sko", "shoes": "Sko",
+    # Bags
+    "bag": "Tasker", "tote": "Tasker", "backpack": "Rygsække",
+    "wallet": "Punge", "purse": "Punge",
+    "crossbody": "Crossbody tasker",
+    # Accessories
+    "scarf": "Tørklæder", "hat": "Hatte", "cap": "Kasketter",
+    "belt": "Bælter", "gloves": "Handsker",
+    "sunglasses": "Solbriller", "jewellery": "Smykker",
+    "perfume": "Parfume", "fragrance": "Parfume",
+}
+
+# Categories that count as "Tøj"
+CLOTHING_TYPES = {
+    "Bukser", "Shorts", "Skjorter", "T-Shirts", "Strik", "Jakker",
+    "Blazere", "Kjoler", "Nederdele", "Toppe", "Bluser", "Hoodies",
+    "Sweatshirts", "Veste", "Poloer",
+}
+
+SHOE_TYPES = {"Sneakers", "Sandaler", "Støvler", "Loafers", "Sko"}
+BAG_TYPES = {"Tasker", "Rygsække", "Punge", "Crossbody tasker"}
 
 
-# ─── Helper: Extract text from PDF ───
+# ─── Session State ───
+for key, default in {
+    "products": [],
+    "step": "upload",
+    "existing_tags": [],
+    "existing_vendors": [],
+    "publications": [],
+    "collections": [],
+    "location_id": None,
+    "push_results": [],
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+# ═══════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════
+
 def extract_pdf_text(pdf_bytes: bytes) -> str:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     text = ""
@@ -38,194 +90,128 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     return text
 
 
-# ─── Helper: STRØM pricing rule ───
-def calculate_retail_price(cost_eur: float) -> float:
-    """Cost (EUR) × EUR_TO_DKK × 2.5, rounded to nearest 50 or 100 DKK."""
-    raw = cost_eur * EUR_TO_DKK * 2.5
-    # Round to nearest 50
+def calculate_retail_price(cost_eur: float, rate: float = EUR_TO_DKK) -> float:
+    raw = cost_eur * rate * 2.5
     rounded = round(raw / 50) * 50
-    # If close to a 100, snap to 100
     if rounded % 100 == 50 and abs(raw - round(raw / 100) * 100) < 30:
         rounded = round(raw / 100) * 100
-    return max(rounded, 50)  # minimum 50 DKK
+    return max(rounded, 50)
 
 
-# ─── Helper: Generate handle ───
-def make_handle(vendor: str, title: str, color: str) -> str:
-    """brand-product-color, lowercase, no special chars."""
-    raw = f"{vendor} {title} {color}"
+def map_type_danish(raw_type: str) -> str:
+    key = raw_type.lower().strip()
+    return TYPE_MAP_DA.get(key, raw_type.title())
+
+
+def make_handle(vendor: str, title: str) -> str:
+    raw = f"{vendor} {title}"
     handle = raw.lower().strip()
-    handle = re.sub(r"[^a-z0-9\s-]", "", handle)
+    handle = re.sub(r"[^a-z0-9æøå\s-]", "", handle)
+    handle = re.sub(r"[æ]", "ae", handle)
+    handle = re.sub(r"[ø]", "oe", handle)
+    handle = re.sub(r"[å]", "aa", handle)
     handle = re.sub(r"\s+", "-", handle)
     handle = re.sub(r"-+", "-", handle)
     return handle.strip("-")
 
 
-# ─── Helper: Type mapping ───
-TYPE_MAP = {
-    "pants": "Trouser",
-    "pantalon": "Trouser",
-    "trousers": "Trouser",
-    "trouser": "Trouser",
-    "shorts": "Trouser",
-    "short": "Trouser",
-    "bermuda": "Trouser",
-    "shirt": "Shirt",
-    "chemise": "Shirt",
-    "t-shirt": "T-Shirt",
-    "tee": "T-Shirt",
-    "knit": "Knit",
-    "knitwear": "Knit",
-    "pull": "Knit",
-    "pullover": "Knit",
-    "sweater": "Knit",
-    "cardigan": "Knit",
-    "jacket": "Jacket",
-    "coat": "Jacket",
-    "blazer": "Jacket",
-    "dress": "Dress",
-    "skirt": "Skirt",
-    "top": "Top",
-    "blouse": "Top",
-}
+def build_tags(product: dict) -> list[str]:
+    """Build STRØM tags list based on all rules."""
+    tags = []
+
+    # Gender tag
+    gender = product.get("gender", "").lower()
+    if gender == "unisex":
+        tags.extend(["men", "women"])
+    elif gender in ("men", "menswear", "herrer"):
+        tags.append("men")
+    elif gender in ("women", "womenswear", "damer"):
+        tags.append("women")
+
+    # Brand tag
+    vendor = product.get("vendor", "")
+    if vendor:
+        tags.append(vendor)
+
+    # Product type tag (Danish)
+    type_da = product.get("product_type_da", "")
+    if type_da:
+        tags.append(type_da)
+
+    # "Tøj" for clothing
+    if type_da in CLOTHING_TYPES:
+        tags.append("Tøj")
+
+    # Shoe subtypes
+    if type_da in SHOE_TYPES:
+        tags.append(type_da)
+
+    # Bag subtypes
+    if type_da in BAG_TYPES:
+        tags.append(type_da)
+
+    # Acne Studios exception
+    if "acne" in vendor.lower():
+        tags.append("acne-products")
+
+    # Add any AI-suggested tags that match existing store tags
+    ai_tags = product.get("ai_tags", [])
+    existing = set(st.session_state.existing_tags)
+    for t in ai_tags:
+        if t in existing and t not in tags:
+            tags.append(t)
+
+    return tags
 
 
-def map_product_type(raw_type: str) -> str:
-    """Map raw product type to STRØM type."""
-    key = raw_type.lower().strip()
-    return TYPE_MAP.get(key, raw_type.title())
+def build_description_da(product: dict) -> str:
+    """Build STRØM product description in Danish."""
+    title = product.get("title", "")
+    vendor = product.get("vendor", "")
+    color = product.get("color", "")
+    material = product.get("material", "")
+    country = product.get("country_of_origin", "")
+
+    country_map = {
+        "VN": "Vietnam", "JP": "Japan", "FR": "Frankrig", "PT": "Portugal",
+        "IT": "Italien", "CN": "Kina", "TR": "Tyrkiet", "IN": "Indien",
+        "DK": "Danmark", "SE": "Sverige", "ES": "Spanien", "DE": "Tyskland",
+        "GB": "Storbritannien", "US": "USA", "MA": "Marokko",
+        "TN": "Tunesien", "BG": "Bulgarien", "RO": "Rumænien", "PL": "Polen",
+    }
+    country_name = country_map.get(country.upper(), country) if country else ""
+
+    lines = [f"<p>{title} fra {vendor}.</p>"]
+    lines.append("<p>Eksklusivt design med fokus på pasform og kvalitet. Et raffineret stykke designet til en moderne garderobe.</p>")
+
+    details = []
+    if color:
+        details.append(f"Farve: {color}")
+    if material:
+        details.append(f"Materiale: {material}")
+    if country_name:
+        details.append(f"Produceret i: {country_name}")
+    if details:
+        lines.append(f"<p>{' | '.join(details)}</p>")
+
+    return "\n".join(lines)
 
 
-# ─── Helper: AI Extract Products ───
-def extract_products_with_ai(pdf_text: str) -> list[dict]:
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+def build_description_en(product: dict) -> str:
+    """Build English translation of description."""
+    title = product.get("title", "")
+    vendor = product.get("vendor", "")
+    color = product.get("color", "")
+    material = product.get("material", "")
+    country = product.get("country_of_origin", "")
 
-    system_prompt = """You are a Shopify/Matrixify product data expert for STRØM (stromstore.dk), a premium Scandinavian fashion retailer.
-
-Your job: extract product data from supplier invoices and return structured JSON.
-
-EXTRACTION RULES:
-1. Extract EVERY product line from the invoice.
-2. Identify: brand/vendor, product name, style/article code, color, material, country of origin, season, sizes with quantities, cost price (unit net price).
-
-TITLE RULES (CRITICAL):
-- Format: "Product Name Color" (e.g. "Classic Shirt Blue")
-- REMOVE all style codes, article codes, internal references from title
-- REMOVE color codes (only use color NAME)
-- No hyphens, no ALL CAPS, no codes
-- Clean, readable product names in the original language or English
-
-COLOR RULES:
-- Extract clean color name only (no codes)
-- Translate French colors to English: BLANC CASSE → Off White, GRIS CHINE → Grey Melange, CREME MOULI → Cream Mouliné, VICHY BLEU → Blue Check, NOIR → Black, BLEU → Blue, ROUGE → Red, VERT → Green, MARRON → Brown, BEIGE → Beige, ROSE → Pink
-
-MATERIAL: Keep as-is from invoice (e.g. "100% NYLON", "100% COTON")
-
-COUNTRY OF ORIGIN: Extract if available, use ISO 2-letter code (VN, JP, FR, PT, IT, etc.)
-
-SEASON: Extract if available (e.g. "E26" → "SS26", "H26" → "FW26")
-
-PRODUCT TYPE: Classify each product:
-- Pants/Pantalon/Trousers/Shorts/Bermuda → "Trouser"
-- Shirt/Chemise → "Shirt"
-- T-shirt/Tee → "T-Shirt"
-- Pull/Pullover/Sweater/Knit/Cardigan → "Knit"
-- Jacket/Coat/Blazer → "Jacket"
-- Dress → "Dress"
-
-GENDER: Determine from context. If "UNISEX" mentioned, use "Unisex". Otherwise infer from product/collection. Default to "Womenswear" if unclear for American Vintage, "Unisex" for CDG.
-
-SIZE RULES:
-- Keep sizes as found (XS, S, M, L, XL, etc.)
-- If combined sizes like "M/L", keep as-is
-
-HS CODE: Include if found on invoice (customs/tariff code, usually 8 digits). Otherwise leave empty.
-
-Return ONLY valid JSON array:
-[
-  {
-    "style_code": "original article/style code",
-    "title": "Clean Product Name Color",
-    "vendor": "Brand Name",
-    "product_type": "mapped type",
-    "gender": "Womenswear/Menswear/Unisex",
-    "color": "clean color name",
-    "material": "composition",
-    "country_of_origin": "ISO 2-letter code or empty",
-    "hs_code": "harmonized system code or empty",
-    "season": "SS26/FW26/etc or empty",
-    "cost_price_eur": unit net price as number,
-    "variants": [
-      {"size": "S", "quantity": 2},
-      {"size": "M", "quantity": 3}
-    ]
-  }
-]"""
-
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Extract all products from this supplier invoice:\n\n{pdf_text}",
-            }
-        ],
-        system=system_prompt,
-    )
-
-    response_text = message.content[0].text
-
-    # Extract JSON from response
-    json_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", response_text)
-    if json_match:
-        json_str = json_match.group(1).strip()
-    else:
-        json_str = response_text.strip()
-
-    return json.loads(json_str)
-
-
-# ─── Helper: Build Matrixify CSV ───
-MATRIXIFY_HEADERS = [
-    "Handle",
-    "Title",
-    "Body (HTML)",
-    "Vendor",
-    "Type",
-    "Tags",
-    "Published",
-    "Option1 Name",
-    "Option1 Value",
-    "Variant SKU",
-    "Variant Grams",
-    "Variant Inventory Tracker",
-    "Variant Inventory Qty",
-    "Variant Inventory Policy",
-    "Variant Fulfillment Service",
-    "Variant Price",
-    "Variant Compare At Price",
-    "Variant Requires Shipping",
-    "Variant Taxable",
-    "Variant Cost",
-    "Variant Country of Origin",
-    "Variant Harmonized System Code",
-    "Image Src",
-    "SEO Title",
-    "SEO Description",
-    "Status",
-]
-
-
-def build_description(title: str, vendor: str, color: str, material: str, country: str) -> str:
-    """Build STRØM-tone product description."""
-    country_name = {
+    country_map = {
         "VN": "Vietnam", "JP": "Japan", "FR": "France", "PT": "Portugal",
         "IT": "Italy", "CN": "China", "TR": "Turkey", "IN": "India",
         "DK": "Denmark", "SE": "Sweden", "ES": "Spain", "DE": "Germany",
         "GB": "United Kingdom", "US": "United States", "MA": "Morocco",
-        "TN": "Tunisia", "BG": "Bulgaria", "RO": "Romania", "PL": "Poland",
-    }.get(country.upper(), country) if country else ""
+    }
+    country_name = country_map.get(country.upper(), country) if country else ""
 
     lines = [f"<p>{title} from {vendor}.</p>"]
     lines.append("<p>Exclusive design focused on fit and quality. A refined piece designed for a modern wardrobe.</p>")
@@ -237,161 +223,429 @@ def build_description(title: str, vendor: str, color: str, material: str, countr
         details.append(f"Material: {material}")
     if country_name:
         details.append(f"Produced in: {country_name}")
-
     if details:
         lines.append(f"<p>{' | '.join(details)}</p>")
 
     return "\n".join(lines)
 
 
-def build_tags(vendor: str, product_type: str, gender: str, season: str, material: str) -> str:
-    """Build STRØM tag string."""
-    tags = [vendor, product_type, gender]
-    if season:
-        tags.append(season)
-    if material:
-        # Simplify material for tag (e.g. "100% COTON" → "Cotton")
-        mat_lower = material.lower()
-        if "cotton" in mat_lower or "coton" in mat_lower:
-            tags.append("Cotton")
-        elif "wool" in mat_lower or "laine" in mat_lower:
-            tags.append("Wool")
-        elif "nylon" in mat_lower:
-            tags.append("Nylon")
-        elif "polyester" in mat_lower:
-            tags.append("Polyester")
-        elif "linen" in mat_lower or "lin" in mat_lower:
-            tags.append("Linen")
-        elif "silk" in mat_lower or "soie" in mat_lower:
-            tags.append("Silk")
-        elif "cashmere" in mat_lower or "cachemire" in mat_lower:
-            tags.append("Cashmere")
-        else:
-            tags.append(material.title())
-    return ", ".join([t for t in tags if t])
+# ═══════════════════════════════════════════════
+# AI EXTRACTION
+# ═══════════════════════════════════════════════
+
+def extract_products_with_ai(pdf_text: str, existing_tags: list[str]) -> list[dict]:
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    tag_list = ", ".join(existing_tags) if existing_tags else "(ingen eksisterende tags)"
+
+    system_prompt = f"""Du er en Shopify-produktekspert for STRØM (stromstore.dk), en premium skandinavisk modebutik.
+
+Udtræk produktdata fra leverandørfakturaer og returnér struktureret JSON.
+
+REGLER FOR UDTRÆK:
+1. Udtræk ALLE produktlinjer fra fakturaen.
+2. Identificér: brand/vendor, produktnavn, style-kode, farve, materiale, oprindelsesland, sæson, størrelser med antal, kostpris (unit net price).
+
+TITEL-REGLER (KRITISK):
+- Format: "Produktnavn Farvenavn" (f.eks. "Classic Shirt Blue")
+- FJERN alle style-koder, artikelkoder, interne referencer
+- FJERN farvekoder (kun farveNAVN)
+- Ingen bindestreger, ingen CAPS LOCK, ingen koder
+- Rene, læsbare produktnavne
+
+FARVE-REGLER:
+- Kun rent farvenavn (ingen koder)
+- Oversæt franske farver: BLANC CASSE → Off White, GRIS CHINE → Grey Melange, CREME MOULI → Cream Mouliné, VICHY BLEU → Blue Check, NOIR → Black, BLEU → Blue, ROUGE → Red, VERT → Green, MARRON → Brown, BEIGE → Beige, ROSE → Pink
+
+MATERIALE: Behold som det står (f.eks. "100% NYLON", "100% COTON")
+
+OPRINDELSESLAND: ISO 2-bogstavs kode (VN, JP, FR, PT, IT osv.) eller tom.
+
+SÆSON: "E26" → "SS26", "H26" → "FW26"
+
+PRODUKTTYPE (på engelsk, vi mapper til dansk efterfølgende):
+- Pants/Pantalon/Shorts/Bermuda → "Trouser"
+- Shirt/Chemise → "Shirt"
+- T-shirt/Tee → "T-Shirt"
+- Pull/Pullover/Sweater/Knit/Cardigan → "Knit"
+- Jacket/Coat/Blazer → "Jacket"
+- Dress → "Dress"
+- Sneaker/Sandal/Boot → den specifikke skotype
+- Bag/Tote/Wallet → den specifikke tasketype
+
+KØN: "Unisex" hvis nævnt. Standard "Womenswear" for American Vintage, "Unisex" for CDG.
+
+EKSISTERENDE TAGS I BUTIKKEN:
+{tag_list}
+
+Foreslå relevante tags fra listen ovenfor i "ai_tags" feltet. Du må foreslå nye tags kun hvis ingen eksisterende passer.
+
+Returnér KUN valid JSON array:
+[
+  {{
+    "style_code": "original artikelkode",
+    "title": "Rent Produktnavn Farvenavn",
+    "vendor": "Brand Name",
+    "product_type": "engelsk type (Trouser, Shirt, etc.)",
+    "gender": "Womenswear/Menswear/Unisex",
+    "color": "rent farvenavn",
+    "material": "sammensætning eller tom",
+    "country_of_origin": "ISO kode eller tom",
+    "hs_code": "HS kode eller tom",
+    "season": "SS26/FW26 eller tom",
+    "cost_price_eur": enhedspris som tal,
+    "ai_tags": ["foreslåede", "tags", "fra", "eksisterende"],
+    "variants": [
+      {{"size": "S", "quantity": 2}},
+      {{"size": "M", "quantity": 3}}
+    ]
+  }}
+]"""
+
+    message = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4096,
+        messages=[
+            {
+                "role": "user",
+                "content": f"Udtræk alle produkter fra denne leverandørfaktura:\n\n{pdf_text}",
+            }
+        ],
+        system=system_prompt,
+    )
+
+    response_text = message.content[0].text
+    json_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", response_text)
+    if json_match:
+        json_str = json_match.group(1).strip()
+    else:
+        json_str = response_text.strip()
+
+    return json.loads(json_str)
 
 
-def products_to_matrixify_csv(products: list[dict]) -> str:
-    """Convert product list to Matrixify-compatible CSV."""
-    output = StringIO()
-    writer = csv.writer(output)
-    writer.writerow(MATRIXIFY_HEADERS)
+# ═══════════════════════════════════════════════
+# IMAGE SEARCH
+# ═══════════════════════════════════════════════
 
-    for product in products:
-        handle = make_handle(
-            product["vendor"],
-            product.get("clean_title", product["title"]),
-            product["color"]
+def find_product_image(vendor: str, style_code: str, title: str) -> str:
+    """
+    Search for product packshot image from brand websites.
+    Returns image URL or empty string.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+    }
+    vendor_lower = vendor.lower()
+
+    # Brand-specific search strategies
+    search_urls = []
+
+    if "american vintage" in vendor_lower:
+        search_urls.append(
+            f"https://www.americanvintage-store.com/en/search?q={requests.utils.quote(style_code)}"
         )
-        title = product["title"]
-        vendor = product["vendor"]
-        product_type = product["product_type"]
-        color = product["color"]
-        material = product.get("material", "")
-        country = product.get("country_of_origin", "")
-        hs_code = product.get("hs_code", "")
-        season = product.get("season", "")
-        gender = product.get("gender", "Womenswear")
-        cost_eur = product.get("cost_price_eur", 0)
-        retail_price = product.get("retail_price_dkk", calculate_retail_price(cost_eur))
+    elif "comme des" in vendor_lower or "cdg" in vendor_lower:
+        search_urls.append(
+            f"https://shop.doverstreetmarket.com/search?q={requests.utils.quote(style_code)}"
+        )
+        search_urls.append(
+            f"https://www.ssense.com/en-dk/search?q={requests.utils.quote(style_code)}"
+        )
+    elif "acne" in vendor_lower:
+        search_urls.append(
+            f"https://www.acnestudios.com/dk/en/search?q={requests.utils.quote(style_code)}"
+        )
 
-        body_html = build_description(title, vendor, color, material, country)
-        tags = build_tags(vendor, product_type, gender, season, material)
-        seo_title = f"{title} | STRØM Store"
-        seo_desc = f"Shop {title} from {vendor} at STRØM. Premium Scandinavian fashion."
+    # Generic fallbacks
+    search_urls.append(
+        f"https://www.ssense.com/en-dk/search?q={requests.utils.quote(vendor + ' ' + style_code)}"
+    )
 
-        variants = product.get("variants", [])
+    for url in search_urls:
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if not response.ok:
+                continue
 
-        for i, variant in enumerate(variants):
-            size = variant["size"]
-            qty = variant.get("quantity", 0)
-            sku = f"{product.get('style_code', '')}-{size}"
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(response.text, "html.parser")
 
-            if i == 0:
-                # First row: all product fields + first variant
-                row = [
-                    handle,             # Handle
-                    title,              # Title
-                    body_html,          # Body (HTML)
-                    vendor,             # Vendor
-                    product_type,       # Type
-                    tags,               # Tags
-                    "FALSE",            # Published (draft)
-                    "Size",             # Option1 Name
-                    size,               # Option1 Value
-                    sku,                # Variant SKU
-                    "",                 # Variant Grams
-                    "shopify",          # Variant Inventory Tracker
-                    qty,                # Variant Inventory Qty
-                    "deny",             # Variant Inventory Policy
-                    "manual",           # Variant Fulfillment Service
-                    retail_price,       # Variant Price
-                    "",                 # Variant Compare At Price
-                    "TRUE",             # Variant Requires Shipping
-                    "TRUE",             # Variant Taxable
-                    cost_eur,           # Variant Cost (kept in EUR)
-                    country,            # Variant Country of Origin
-                    hs_code,            # Variant HS Code
-                    "",                 # Image Src
-                    seo_title,          # SEO Title
-                    seo_desc,           # SEO Description
-                    "draft",            # Status
-                ]
-            else:
-                # Subsequent rows: only handle + variant data
-                row = [
-                    handle,             # Handle
-                    "",                 # Title
-                    "",                 # Body (HTML)
-                    "",                 # Vendor
-                    "",                 # Type
-                    "",                 # Tags
-                    "",                 # Published
-                    "Size",             # Option1 Name
-                    size,               # Option1 Value
-                    sku,                # Variant SKU
-                    "",                 # Variant Grams
-                    "shopify",          # Variant Inventory Tracker
-                    qty,                # Variant Inventory Qty
-                    "deny",             # Variant Inventory Policy
-                    "manual",           # Variant Fulfillment Service
-                    retail_price,       # Variant Price
-                    "",                 # Variant Compare At Price
-                    "TRUE",             # Variant Requires Shipping
-                    "TRUE",             # Variant Taxable
-                    cost_eur,           # Variant Cost
-                    country,            # Variant Country of Origin
-                    hs_code,            # Variant HS Code
-                    "",                 # Image Src
-                    "",                 # SEO Title
-                    "",                 # SEO Description
-                    "",                 # Status
-                ]
+            # Look for product images
+            for img in soup.find_all("img"):
+                src = img.get("src", "") or img.get("data-src", "") or ""
+                alt = (img.get("alt", "") or "").lower()
 
-            writer.writerow(row)
+                if not src:
+                    continue
 
-    return output.getvalue()
+                # Filter for product images
+                is_product = any(kw in src.lower() for kw in [
+                    "product", "catalog", "media", "cdn.shopify", "images/products"
+                ])
+                has_matching_alt = style_code.lower() in alt or any(
+                    w in alt for w in title.lower().split()[:2]
+                )
+
+                if is_product or has_matching_alt:
+                    if src.startswith("//"):
+                        src = "https:" + src
+                    return src
+
+        except Exception:
+            continue
+
+    return ""
 
 
-# ─── UI ───
+# ═══════════════════════════════════════════════
+# SHOPIFY PRODUCT PUSH
+# ═══════════════════════════════════════════════
+
+def push_product_to_shopify(
+    shopify: ShopifyGraphQL,
+    product: dict,
+    eur_rate: float,
+    publications: list[dict],
+    collections: list[dict],
+    location_id: str,
+) -> dict:
+    """
+    Push a single product to Shopify with all fields.
+    Returns result dict with status info.
+    """
+    title = product["title"]
+    vendor = product["vendor"]
+    type_da = product.get("product_type_da", "")
+    color = product.get("color", "")
+    material = product.get("material", "")
+    cost_eur = product.get("cost_price_eur", 0)
+    cost_dkk = round(cost_eur * eur_rate, 2)
+    retail_price = product.get("retail_price_dkk", 0)
+
+    # Build tags
+    tags = build_tags(product)
+
+    # Description (Danish)
+    body_html = build_description_da(product)
+
+    # Weight = same as price in grams
+    weight = retail_price
+    weight_unit = "GRAMS"
+
+    # Build variants
+    variants = []
+    for v in product.get("variants", []):
+        variants.append({
+            "sku": f"{product.get('style_code', '')}-{v['size']}",
+            "price": str(retail_price),
+            "weight": weight,
+            "weightUnit": weight_unit,
+            "inventoryManagement": "SHOPIFY",
+            "inventoryPolicy": "DENY",
+            "requiresShipping": True,
+            "taxable": True,
+            "options": [v["size"]],
+        })
+
+    # SEO
+    seo_title = f"{title} | STRØM"
+    seo_desc = f"Køb {title} fra {vendor} hos STRØM. Premium skandinavisk mode."
+
+    # Product input
+    product_input = {
+        "title": title,
+        "bodyHtml": body_html,
+        "vendor": vendor,
+        "productType": type_da,
+        "tags": tags,
+        "status": "DRAFT",
+        "options": ["Størrelse"],
+        "variants": variants,
+        "seo": {
+            "title": seo_title,
+            "description": seo_desc,
+        },
+    }
+
+    # 1. Create product
+    created = shopify.create_product(product_input)
+    product_id = created["id"]
+
+    # 2. Set inventory quantities + cost per variant
+    variant_edges = created.get("variants", {}).get("edges", [])
+    for idx, edge in enumerate(variant_edges):
+        variant_node = edge["node"]
+        inv_item_id = variant_node["inventoryItem"]["id"]
+
+        # Set quantity
+        if idx < len(product.get("variants", [])):
+            qty = product["variants"][idx].get("quantity", 0)
+            try:
+                shopify.set_inventory_quantity(inv_item_id, location_id, qty)
+            except Exception:
+                pass
+
+        # Set cost + country + HS code
+        try:
+            shopify.update_inventory_item_cost(
+                inv_item_id,
+                cost_dkk,
+                product.get("country_of_origin", ""),
+                product.get("hs_code", ""),
+            )
+        except Exception:
+            pass
+
+    # 3. Set metafields (gender)
+    gender = product.get("gender", "").lower()
+    gender_values = []
+    if gender == "unisex":
+        gender_values = ["men", "women"]
+    elif gender in ("men", "menswear", "herrer"):
+        gender_values = ["men"]
+    elif gender in ("women", "womenswear", "damer"):
+        gender_values = ["women"]
+
+    if gender_values:
+        metafields = [
+            {
+                "namespace": "custom",
+                "key": "gender",
+                "value": json.dumps(gender_values) if len(gender_values) > 1 else gender_values[0],
+                "type": "list.single_line_text_field" if len(gender_values) > 1 else "single_line_text_field",
+            }
+        ]
+
+        # Brand collection metafield
+        metafields.append({
+            "namespace": "custom",
+            "key": "brand_collection",
+            "value": vendor,
+            "type": "single_line_text_field",
+        })
+
+        try:
+            shopify.set_metafields(product_id, metafields)
+        except Exception:
+            pass
+
+    # 4. Add image if found
+    image_url = product.get("image_url", "")
+    if image_url:
+        try:
+            shopify.add_image_by_url(product_id, image_url, alt_text=title)
+        except Exception:
+            pass
+
+    # 5. Publish to all channels
+    if publications:
+        pub_ids = [p["id"] for p in publications]
+        try:
+            shopify.publish_product(product_id, pub_ids)
+        except Exception:
+            pass
+
+    # 6. Add to brand collection
+    vendor_lower = vendor.lower().strip()
+    for col in collections:
+        col_title_lower = col["title"].lower().strip()
+        col_handle_lower = col["handle"].lower().strip()
+        if vendor_lower in col_title_lower or vendor_lower in col_handle_lower:
+            try:
+                shopify.add_product_to_collection(col["id"], product_id)
+            except Exception:
+                pass
+            break
+
+    # 7. Create English translation
+    try:
+        translatable = shopify.get_translatable_content(product_id)
+        translations = []
+        for content in translatable:
+            if content["key"] == "title":
+                translations.append({
+                    "key": "title",
+                    "value": title,  # Title stays the same
+                    "digest": content["digest"],
+                })
+            elif content["key"] == "body_html":
+                translations.append({
+                    "key": "body_html",
+                    "value": build_description_en(product),
+                    "digest": content["digest"],
+                })
+            elif content["key"] == "meta_title":
+                translations.append({
+                    "key": "meta_title",
+                    "value": f"{title} | STRØM",
+                    "digest": content["digest"],
+                })
+            elif content["key"] == "meta_description":
+                translations.append({
+                    "key": "meta_description",
+                    "value": f"Shop {title} from {vendor} at STRØM. Premium Scandinavian fashion.",
+                    "digest": content["digest"],
+                })
+
+        if translations:
+            shopify.create_translation(product_id, translations, locale="en")
+    except Exception:
+        pass
+
+    return {
+        "product_id": product_id,
+        "title": title,
+        "variants": len(variant_edges),
+    }
+
+
+# ═══════════════════════════════════════════════
+# UI
+# ═══════════════════════════════════════════════
 
 st.title("STRØM — Produkt Import")
-st.caption("Upload faktura → AI udtræk → Download Matrixify CSV")
+st.caption("Upload faktura → AI udtræk → Review → Push til Shopify")
 
-# Sidebar
+# ─── Sidebar ───
 with st.sidebar:
     st.header("Status")
-    if not ANTHROPIC_API_KEY:
-        st.error("Mangler ANTHROPIC_API_KEY")
-    else:
+
+    api_ok = bool(ANTHROPIC_API_KEY)
+    shopify_ok = bool(SHOPIFY_ACCESS_TOKEN)
+
+    if api_ok:
         st.success("Claude API ✓")
+    else:
+        st.error("Mangler ANTHROPIC_API_KEY")
+
+    if shopify_ok:
+        st.success("Shopify API ✓")
+    else:
+        st.error("Mangler SHOPIFY_ACCESS_TOKEN")
+
+    # Load Shopify data on first run
+    if shopify_ok and not st.session_state.existing_tags:
+        shopify = ShopifyGraphQL(SHOPIFY_STORE, SHOPIFY_ACCESS_TOKEN)
+        with st.spinner("Henter data fra Shopify..."):
+            try:
+                st.session_state.existing_tags = shopify.fetch_all_tags()
+                st.session_state.existing_vendors = shopify.fetch_all_vendors()
+                st.session_state.publications = shopify.fetch_publications()
+                st.session_state.collections = shopify.fetch_collections()
+                st.session_state.location_id = shopify.get_primary_location_id()
+            except Exception as e:
+                st.error(f"Shopify-fejl: {e}")
+
+        st.caption(f"{len(st.session_state.existing_tags)} tags")
+        st.caption(f"{len(st.session_state.existing_vendors)} vendors")
+        st.caption(f"{len(st.session_state.publications)} kanaler")
+        st.caption(f"{len(st.session_state.collections)} collections")
 
     st.divider()
 
-    st.caption("EUR → DKK kurs")
     eur_rate = st.number_input(
-        "Kurs", value=EUR_TO_DKK, step=0.01, format="%.2f", key="eur_rate",
-        help="Bruges til prisberegning (cost × kurs × 2.5)"
+        "EUR → DKK", value=EUR_TO_DKK, step=0.01, format="%.2f", key="eur_rate",
     )
 
     st.divider()
@@ -399,13 +653,13 @@ with st.sidebar:
     if st.button("Start forfra"):
         st.session_state.products = []
         st.session_state.step = "upload"
-        st.session_state.csv_data = None
+        st.session_state.push_results = []
         st.rerun()
 
 
-# ════════════════════════════════════════════
-# STEP 1: Upload PDF
-# ════════════════════════════════════════════
+# ═══════════════════════════════════════════════
+# STEP 1: Upload
+# ═══════════════════════════════════════════════
 if st.session_state.step == "upload":
     st.header("1. Upload faktura")
 
@@ -423,115 +677,210 @@ if st.session_state.step == "upload":
                 pdf_bytes = uploaded_file.read()
                 pdf_text = extract_pdf_text(pdf_bytes)
 
-            with st.spinner(f"AI udtrækker produktdata fra {uploaded_file.name}..."):
+            with st.spinner(f"AI udtræk fra {uploaded_file.name}..."):
                 try:
-                    products = extract_products_with_ai(pdf_text)
-                    # Post-process: apply STRØM rules
+                    products = extract_products_with_ai(
+                        pdf_text, st.session_state.existing_tags
+                    )
                     for p in products:
-                        p["product_type"] = map_product_type(p.get("product_type", ""))
-                        p["retail_price_dkk"] = calculate_retail_price(p.get("cost_price_eur", 0))
+                        # Map type to Danish
+                        p["product_type_da"] = map_type_danish(p.get("product_type", ""))
+                        # Calculate prices
+                        p["retail_price_dkk"] = calculate_retail_price(
+                            p.get("cost_price_eur", 0), eur_rate
+                        )
+                        p["cost_dkk"] = round(p.get("cost_price_eur", 0) * eur_rate, 2)
+                        # Build tags
+                        p["computed_tags"] = build_tags(p)
 
-                    st.success(f"{uploaded_file.name}: {len(products)} produkter fundet")
+                    st.success(f"{uploaded_file.name}: {len(products)} produkter")
                     all_products.extend(products)
                 except Exception as e:
-                    st.error(f"Fejl ved {uploaded_file.name}: {str(e)}")
+                    st.error(f"Fejl: {str(e)}")
 
         if all_products:
+            # Search for images
+            with st.spinner("Søger produktbilleder..."):
+                for p in all_products:
+                    img = find_product_image(
+                        p["vendor"], p.get("style_code", ""), p["title"]
+                    )
+                    p["image_url"] = img
+
             st.session_state.products = all_products
             st.session_state.step = "review"
             st.rerun()
 
 
-# ════════════════════════════════════════════
-# STEP 2: Review & Download
-# ════════════════════════════════════════════
+# ═══════════════════════════════════════════════
+# STEP 2: Review
+# ═══════════════════════════════════════════════
 elif st.session_state.step == "review":
     products = st.session_state.products
     st.header(f"2. Review ({len(products)} produkter)")
 
-    # Summary table
     for i, p in enumerate(products):
-        handle = make_handle(p["vendor"], p["title"], p["color"])
         total_qty = sum(v.get("quantity", 0) for v in p.get("variants", []))
-        sizes = ", ".join([f"{v['size']}({v['quantity']})" for v in p.get("variants", [])])
 
         with st.expander(
-            f"**{p['vendor']}** — {p['title']} | {p['color']} | {total_qty} stk | {p['retail_price_dkk']:.0f} DKK",
-            expanded=False,
+            f"**{p['vendor']}** — {p['title']} | {total_qty} stk | {p.get('retail_price_dkk', 0):.0f} DKK",
+            expanded=(i == 0),
         ):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.text(f"Handle: {handle}")
-                st.text(f"SKU: {p.get('style_code', '')}")
-                st.text(f"Type: {p['product_type']}")
-                st.text(f"Gender: {p.get('gender', 'N/A')}")
-            with col2:
-                st.text(f"Cost: €{p.get('cost_price_eur', 0):.2f}")
-                st.text(f"Retail: {p['retail_price_dkk']:.0f} DKK")
-                st.text(f"Material: {p.get('material', 'N/A')}")
-                st.text(f"Origin: {p.get('country_of_origin', 'N/A')}")
-            with col3:
-                st.text(f"Season: {p.get('season', 'N/A')}")
-                st.text(f"HS Code: {p.get('hs_code', 'N/A')}")
-                st.text(f"Sizes: {sizes}")
+            preview_col, data_col = st.columns([1, 1])
 
-            tags = build_tags(p["vendor"], p["product_type"], p.get("gender", ""), p.get("season", ""), p.get("material", ""))
-            st.text(f"Tags: {tags}")
+            # ── Preview ──
+            with preview_col:
+                st.markdown("##### Preview")
 
-            # Editable retail price
-            new_price = st.number_input(
-                "Ret udsalgspris (DKK)",
-                value=float(p["retail_price_dkk"]),
-                step=50.0,
-                key=f"price_{i}",
-            )
-            st.session_state.products[i]["retail_price_dkk"] = new_price
+                # Image
+                if p.get("image_url"):
+                    st.image(p["image_url"], width=200)
+                else:
+                    st.caption("Intet billede fundet")
+
+                st.markdown(
+                    f"""
+                    <div style="border:1px solid #333; border-radius:8px; padding:16px; background:#1a1a1a; margin-top:8px;">
+                        <p style="color:#888; font-size:11px; letter-spacing:2px; margin:0;">
+                            {p['vendor'].upper()}
+                        </p>
+                        <h3 style="margin:6px 0 4px 0; color:#fff; font-size:18px;">{p['title']}</h3>
+                        <p style="color:#ccc; font-size:13px; margin:0 0 8px 0;">{p.get('color', '')}</p>
+                        <p style="font-size:20px; font-weight:600; color:#fff; margin:0 0 12px 0;">
+                            {p.get('retail_price_dkk', 0):.0f} DKK
+                        </p>
+                        <p style="color:#888; font-size:12px; margin:0;">
+                            {' · '.join([v['size'] for v in p.get('variants', [])])}
+                        </p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            # ── Data ──
+            with data_col:
+                st.markdown("##### Shopify-data")
+                cost_dkk = round(p.get("cost_price_eur", 0) * eur_rate, 2)
+
+                st.text(f"Handle:    {make_handle(p['vendor'], p['title'])}")
+                st.text(f"SKU:       {p.get('style_code', '')}")
+                st.text(f"Type:      {p.get('product_type_da', '')}")
+                st.text(f"Vendor:    {p['vendor']}")
+                st.text(f"Gender:    {p.get('gender', 'N/A')}")
+                st.text(f"Cost:      {cost_dkk:.2f} DKK (€{p.get('cost_price_eur', 0):.2f})")
+                st.text(f"Retail:    {p.get('retail_price_dkk', 0):.0f} DKK")
+                st.text(f"Weight:    {p.get('retail_price_dkk', 0):.0f}g")
+                st.text(f"Season:    {p.get('season', 'N/A')}")
+                st.text(f"HS Code:   {p.get('hs_code', 'N/A')}")
+                st.text(f"Origin:    {p.get('country_of_origin', 'N/A')}")
+
+                sizes = ", ".join([f"{v['size']}({v['quantity']})" for v in p.get("variants", [])])
+                st.text(f"Sizes:     {sizes}")
+
+                tags_str = ", ".join(p.get("computed_tags", []))
+                st.text(f"Tags:      {tags_str}")
+
+                # Description preview
+                st.markdown("**Beskrivelse (DA):**")
+                st.markdown(build_description_da(p), unsafe_allow_html=True)
+
+            # ── Editable fields ──
+            st.markdown("---")
+            ec1, ec2, ec3 = st.columns(3)
+
+            with ec1:
+                new_title = st.text_input("Titel", value=p["title"], key=f"title_{i}")
+                st.session_state.products[i]["title"] = new_title
+
+            with ec2:
+                new_price = st.number_input(
+                    "Udsalgspris (DKK)", value=float(p.get("retail_price_dkk", 0)),
+                    step=50.0, key=f"price_{i}",
+                )
+                st.session_state.products[i]["retail_price_dkk"] = new_price
+
+            with ec3:
+                new_tags = st.text_input(
+                    "Tags", value=tags_str, key=f"tags_{i}",
+                )
+                st.session_state.products[i]["computed_tags"] = [
+                    t.strip() for t in new_tags.split(",") if t.strip()
+                ]
 
     st.divider()
 
-    # Generate CSV
     col1, col2 = st.columns([1, 3])
     with col1:
-        if st.button("Generér Matrixify CSV", type="primary"):
-            csv_data = products_to_matrixify_csv(st.session_state.products)
-            st.session_state.csv_data = csv_data
-            st.session_state.step = "download"
+        can_push = shopify_ok and api_ok
+        if st.button("Push til Shopify", type="primary", disabled=not can_push):
+            st.session_state.step = "pushing"
             st.rerun()
     with col2:
-        if st.button("Tilbage til upload"):
+        if st.button("Tilbage"):
             st.session_state.step = "upload"
             st.session_state.products = []
             st.rerun()
 
 
-# ════════════════════════════════════════════
-# STEP 3: Download
-# ════════════════════════════════════════════
-elif st.session_state.step == "download":
-    st.header("3. CSV klar!")
+# ═══════════════════════════════════════════════
+# STEP 3: Push
+# ═══════════════════════════════════════════════
+elif st.session_state.step == "pushing":
+    st.header("3. Opretter i Shopify...")
 
-    csv_data = st.session_state.csv_data
-    total_products = len(st.session_state.products)
-    total_variants = sum(len(p.get("variants", [])) for p in st.session_state.products)
+    shopify = ShopifyGraphQL(SHOPIFY_STORE, SHOPIFY_ACCESS_TOKEN)
+    products = st.session_state.products
+    progress = st.progress(0)
+    results = []
 
-    st.metric("Produkter", total_products)
-    st.metric("Variant-rækker", total_variants)
+    for i, p in enumerate(products):
+        progress.progress((i + 1) / len(products))
 
-    st.download_button(
-        label="Download Matrixify CSV",
-        data=csv_data,
-        file_name="strom_import.csv",
-        mime="text/csv",
-        type="primary",
-    )
+        with st.spinner(f"Opretter {p['title']}..."):
+            try:
+                result = push_product_to_shopify(
+                    shopify=shopify,
+                    product=p,
+                    eur_rate=eur_rate if "eur_rate" in dir() else EUR_TO_DKK,
+                    publications=st.session_state.publications,
+                    collections=st.session_state.collections,
+                    location_id=st.session_state.location_id or "",
+                )
+                results.append({"status": "ok", "title": p["title"], "id": result["product_id"]})
+                st.success(f"✓ {p['title']}")
+            except Exception as e:
+                results.append({"status": "error", "title": p["title"], "error": str(e)})
+                st.error(f"✗ {p['title']}: {e}")
 
-    st.divider()
-    st.subheader("Preview")
-    st.code(csv_data[:2000] + ("..." if len(csv_data) > 2000 else ""), language="csv")
+    progress.progress(1.0)
+    st.session_state.push_results = results
+    st.session_state.step = "done"
+    st.rerun()
 
-    st.divider()
-    if st.button("Importer flere fakturaer"):
+
+# ═══════════════════════════════════════════════
+# STEP 4: Done
+# ═══════════════════════════════════════════════
+elif st.session_state.step == "done":
+    st.header("4. Import fuldført")
+
+    results = st.session_state.push_results
+    ok = [r for r in results if r["status"] == "ok"]
+    fail = [r for r in results if r["status"] == "error"]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Oprettet", len(ok))
+    with col2:
+        st.metric("Fejlede", len(fail))
+
+    for r in ok:
+        st.success(f"✓ {r['title']}")
+    for r in fail:
+        st.error(f"✗ {r['title']}: {r['error']}")
+
+    if st.button("Importer flere", type="primary"):
         st.session_state.products = []
-        st.session_state.csv_data = None
+        st.session_state.push_results = []
         st.session_state.step = "upload"
         st.rerun()
