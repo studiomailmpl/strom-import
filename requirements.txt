@@ -3,4 +3,4 @@ anthropic
 PyMuPDF
 requests
 beautifulsoup4
- 
+Pillow
