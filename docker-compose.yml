@@ -1,0 +1,76 @@
+# ── STRØM Import — Docker Compose ──
+# Usage:
+#   cp .env.production .env
+#   docker compose up -d
+#   docker compose exec backend alembic upgrade head
+
+services:
+  # ── PostgreSQL Database ──
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: strom_import
+      POSTGRES_USER: strom
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change-me-in-production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U strom -d strom_import"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend API ──
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://strom:${DB_PASSWORD:-change-me-in-production}@db:5432/strom_import
+      DATABASE_URL_SYNC: postgresql://strom:${DB_PASSWORD:-change-me-in-production}@db:5432/strom_import
+      DEBUG: "false"
+      CORS_ORIGINS: '["${FRONTEND_URL:-http://localhost:3000}"]'
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      CLERK_SECRET_KEY: ${CLERK_SECRET_KEY}
+      CLERK_PUBLISHABLE_KEY: ${CLERK_PUBLISHABLE_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      SERPAPI_KEY: ${SERPAPI_KEY:-}
+      SHOPIFY_API_KEY: ${SHOPIFY_API_KEY}
+      SHOPIFY_API_SECRET: ${SHOPIFY_API_SECRET}
+      SHOPIFY_APP_URL: ${FRONTEND_URL:-http://localhost:3000}
+      SHOPIFY_REDIRECT_URI: ${BACKEND_URL:-http://localhost:8000}/api/v1/shopify/callback
+      PUBLIC_BASE_URL: ${BACKEND_URL:-http://localhost:8000}
+      UPLOAD_DIR: /tmp/strom-uploads
+      IMAGE_UPLOAD_DIR: /tmp/strom-uploads/product-images
+    volumes:
+      - uploads_data:/tmp/strom-uploads
+
+  # ── Frontend ──
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${BACKEND_URL:-http://localhost:8000}
+        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${CLERK_PUBLISHABLE_KEY}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: ${BACKEND_URL:-http://localhost:8000}
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${CLERK_PUBLISHABLE_KEY}
+
+volumes:
+  postgres_data:
+  uploads_data:
