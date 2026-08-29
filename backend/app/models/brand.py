@@ -6,7 +6,7 @@ Stores image bank configuration for future portal integrations.
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSON, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -15,6 +15,10 @@ from app.core.database import Base
 
 class Brand(Base):
     __tablename__ = "brands"
+    __table_args__ = (
+        # One brand per org per slug — created in the original brands migration.
+        UniqueConstraint("organisation_id", "slug", name="uq_brands_org_slug"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
