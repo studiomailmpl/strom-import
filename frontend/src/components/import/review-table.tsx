@@ -1,8 +1,9 @@
 "use client";
 
-import { useState, useMemo, type ReactNode } from "react";
-import { Check, AlertTriangle, XCircle, Package } from "lucide-react";
+import { useState, useMemo, Fragment, type ReactNode } from "react";
+import { Check, AlertTriangle, XCircle, Package, ChevronDown, ChevronRight } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { ProductCard } from "./product-card";
 import type { ImportProduct, ProductVariant } from "./product-card";
 
 /* ─── Tooltip ─── */
@@ -134,6 +135,9 @@ interface ReviewTableProps {
   onToggleSelect: (productId: string) => void;
   onToggleAll: () => void;
   readOnly?: boolean;
+  /** Persist an edit to a product. When omitted the table stays read-only —
+   *  rows are not expandable and no editor is mounted. */
+  onUpdateProduct?: (productId: string, data: Partial<ImportProduct>) => void | Promise<void>;
 }
 
 /* ─── Component ─── */
@@ -144,7 +148,10 @@ export function ReviewTable({
   onToggleSelect,
   onToggleAll,
   readOnly = false,
+  onUpdateProduct,
 }: ReviewTableProps) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const canEdit = !readOnly && Boolean(onUpdateProduct);
   const flatVariants = useMemo(() => {
     const rows: FlatVariant[] = [];
     for (const product of products) {
@@ -238,6 +245,13 @@ export function ReviewTable({
   }
 
   let lastProductId = "";
+  const colCount = (readOnly ? 0 : 1) + 7;
+
+  const rowBackground = (isSelected: boolean, isExpanded: boolean) => {
+    if (isExpanded) return "var(--bg-secondary)";
+    if (isSelected && !readOnly) return "var(--accent-light)";
+    return "transparent";
+  };
 
   return (
     <div className="card overflow-x-auto rounded-[var(--radius-lg)]">
@@ -307,6 +321,11 @@ export function ReviewTable({
             const showTitle = row.productId !== lastProductId;
             lastProductId = row.productId;
             const isSelected = selectedIds.has(row.productId);
+            const isExpanded = expandedId === row.productId;
+            // A product spans one row per variant — hang the editor off the last of them.
+            const isLastRowOfProduct =
+              idx === flatVariants.length - 1 ||
+              flatVariants[idx + 1].productId !== row.productId;
 
             const skuParts = [
               row.vendor?.substring(0, 3).toUpperCase() || "---",
@@ -317,24 +336,25 @@ export function ReviewTable({
             const sku = skuParts.join("-");
 
             return (
+              <Fragment key={`${row.productId}-${row.size}-${idx}`}>
               <tr
-                key={`${row.productId}-${row.size}-${idx}`}
                 className="transition-colors"
                 style={{
                   borderBottom: "1px solid var(--border-secondary)",
-                  background: isSelected && !readOnly ? "var(--accent-light)" : "transparent",
+                  background: rowBackground(isSelected, isExpanded),
+                  cursor: canEdit ? "pointer" : undefined,
                   ...(showTitle && idx > 0
                     ? { borderTop: "1px solid var(--border-primary)" }
                     : {}),
                 }}
+                onClick={canEdit ? () => setExpandedId(isExpanded ? null : row.productId) : undefined}
                 onMouseEnter={(e) => {
-                  if (!isSelected || readOnly) {
+                  if (!isExpanded && (!isSelected || readOnly)) {
                     e.currentTarget.style.background = "var(--bg-secondary)";
                   }
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.background =
-                    isSelected && !readOnly ? "var(--accent-light)" : "transparent";
+                  e.currentTarget.style.background = rowBackground(isSelected, isExpanded);
                 }}
               >
                 {!readOnly && (
@@ -344,6 +364,7 @@ export function ReviewTable({
                         type="checkbox"
                         checked={isSelected}
                         onChange={() => onToggleSelect(row.productId)}
+                        onClick={(e) => e.stopPropagation()}
                         className="h-4 w-4 rounded"
                         style={{ accentColor: "var(--accent)" }}
                       />
@@ -351,26 +372,41 @@ export function ReviewTable({
                   </td>
                 )}
                 <td className="px-4 py-3">
-                  {showTitle ? (
-                    <div>
-                      <p className="font-medium" style={{ color: "var(--text-primary)" }}>
-                        {row.productTitle}
-                      </p>
+                  <div className="flex items-start gap-1.5">
+                    {canEdit && (
+                      <span className="mt-0.5 flex-shrink-0" style={{ color: "var(--text-tertiary)" }}>
+                        {showTitle ? (
+                          isExpanded ? (
+                            <ChevronDown className="h-3.5 w-3.5" />
+                          ) : (
+                            <ChevronRight className="h-3.5 w-3.5" />
+                          )
+                        ) : (
+                          <span className="inline-block h-3.5 w-3.5" />
+                        )}
+                      </span>
+                    )}
+                    {showTitle ? (
+                      <div>
+                        <p className="font-medium" style={{ color: "var(--text-primary)" }}>
+                          {row.productTitle}
+                        </p>
+                        <p
+                          className="mt-0.5 font-mono text-[11px]"
+                          style={{ color: "var(--text-tertiary)" }}
+                        >
+                          {sku}
+                        </p>
+                      </div>
+                    ) : (
                       <p
-                        className="mt-0.5 font-mono text-[11px]"
+                        className="font-mono text-[11px]"
                         style={{ color: "var(--text-tertiary)" }}
                       >
                         {sku}
                       </p>
-                    </div>
-                  ) : (
-                    <p
-                      className="font-mono text-[11px]"
-                      style={{ color: "var(--text-tertiary)" }}
-                    >
-                      {sku}
-                    </p>
-                  )}
+                    )}
+                  </div>
                 </td>
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-2">
@@ -407,6 +443,24 @@ export function ReviewTable({
                 </td>
                 <td className="px-4 py-3">{statusBadge(row.status, row.warnings)}</td>
               </tr>
+              {canEdit && isExpanded && isLastRowOfProduct && (
+                <tr style={{ borderBottom: "1px solid var(--border-primary)" }}>
+                  <td
+                    colSpan={colCount}
+                    className="p-4"
+                    style={{ background: "var(--bg-secondary)" }}
+                  >
+                    <ProductCard
+                      product={row.product}
+                      defaultExpanded
+                      onUpdate={(id, data) => onUpdateProduct?.(id, data)}
+                      onApprove={(id) => onUpdateProduct?.(id, { status: "approved" })}
+                      onSkip={(id) => onUpdateProduct?.(id, { status: "skipped" })}
+                    />
+                  </td>
+                </tr>
+              )}
+              </Fragment>
             );
           })}
         </tbody>

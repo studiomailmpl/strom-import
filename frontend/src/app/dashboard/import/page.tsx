@@ -314,6 +314,33 @@ export default function ImportPage() {
     }
   };
 
+  /* ─── EDIT ─── */
+
+  const handleUpdateProduct = useCallback(
+    async (productId: string, data: Partial<ImportProduct>) => {
+      try {
+        const token = await getToken();
+        const updated = await apiFetch<ImportProduct>(
+          `/api/v1/products/${productId}`,
+          {
+            method: "PATCH",
+            token: token || undefined,
+            body: JSON.stringify(data),
+          }
+        );
+        setProducts((prev) =>
+          prev.map((p) => (p.id === productId ? { ...p, ...updated } : p))
+        );
+        toast.success("Produkt opdateret");
+      } catch (err) {
+        toast.error(
+          err instanceof Error ? err.message : "Kunne ikke opdatere produktet"
+        );
+      }
+    },
+    [getToken]
+  );
+
   /* ─── PUSH ─── */
 
   const handlePush = async () => {
@@ -645,6 +672,7 @@ export default function ImportPage() {
               selectedIds={selectedIds}
               onToggleSelect={handleToggleSelect}
               onToggleAll={handleToggleAll}
+              onUpdateProduct={handleUpdateProduct}
             />
           </div>
 

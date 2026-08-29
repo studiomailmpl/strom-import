@@ -84,6 +84,9 @@ interface ProductCardProps {
   onSkip: (id: string) => void;
   onUpdate: (id: string, data: Partial<ImportProduct>) => void;
   onToggleRestock?: (productId: string) => void;
+  /** Start with the detail section open — used when the card is mounted
+   *  inside an already-expanded review table row. */
+  defaultExpanded?: boolean;
 }
 
 function WarningTooltip({ warnings, hasErrors }: { warnings: string[]; hasErrors?: boolean }) {
@@ -129,8 +132,9 @@ export function ProductCard({
   onSkip,
   onUpdate,
   onToggleRestock,
+  defaultExpanded = false,
 }: ProductCardProps) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(defaultExpanded);
   const [editing, setEditing] = useState(false);
   const [editData, setEditData] = useState({
     title: product.title,
