@@ -29,7 +29,11 @@ from app.services.invoice_parser import parse_invoice_metadata, parse_invoice_ta
 from app.models.brand import Brand
 from app.models.product_image import ProductImage
 from app.models.order_confirmation import OrderConfirmationLine
-from app.services.ai_extractor import extract_products_with_ai, normalize_season
+from app.services.ai_extractor import (
+    describe_api_error,
+    extract_products_with_ai,
+    normalize_season,
+)
 from app.services.image_service import (
     find_product_images_and_details,
     get_cached_images,
@@ -1179,7 +1183,10 @@ async def _run_analysis(import_id: uuid.UUID):
 
                     _emit_event(sid, {
                         "type": "error",
-                        "message": f"Fejl ved behandling af {fname}: {str(file_err)[:200]}",
+                        "message": (
+                            f"Fejl ved behandling af {fname}: "
+                            f"{describe_api_error(file_err)}"
+                        ),
                     })
                     # Continue with remaining files
                     continue

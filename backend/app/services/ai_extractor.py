@@ -20,6 +20,62 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+# Anthropic errors that a retry cannot fix. Retrying a spend cap or a bad key
+# just burns the backoff and reports the same failure three attempts later.
+_NON_RETRYABLE_MARKERS = (
+    "usage limits",
+    "credit balance",
+    "invalid_api_key",
+    "authentication_error",
+    "permission_error",
+)
+
+
+def is_retryable_api_error(error: Exception) -> bool:
+    """
+    Whether re-issuing the same Claude request could plausibly succeed.
+
+    Rate limits (429) and server errors are worth retrying. A spend cap, an
+    invalid key or a malformed request will fail identically every time.
+    """
+    status = getattr(error, "status_code", None)
+    if status in (429, 500, 502, 503, 504, 529):
+        return True
+    if status in (401, 403, 404, 413):
+        return False
+
+    text = str(error).lower()
+    if any(marker in text for marker in _NON_RETRYABLE_MARKERS):
+        return False
+    if status == 400:
+        # 400s are caller errors; the only retryable flavour is an overload
+        # that some gateways report with this code.
+        return "overloaded" in text
+    return True
+
+
+def describe_api_error(error: Exception) -> str:
+    """A message worth showing a user, instead of the raw API JSON."""
+    text = str(error)
+    lowered = text.lower()
+
+    if "usage limits" in lowered or "credit balance" in lowered:
+        when = ""
+        match = re.search(r"regain access on ([0-9]{4}-[0-9]{2}-[0-9]{2}) at ([0-9:]+ ?UTC)", text)
+        if match:
+            when = f" Adgang vender tilbage {match.group(1)} kl. {match.group(2)}."
+        return (
+            "Anthropic-kontoens forbrugsgrænse er nået, så fakturaen kunne ikke "
+            f"analyseres.{when} Hæv grænsen under Limits i Anthropic Console, "
+            "eller vent og kør importen igen."
+        )
+    if "invalid_api_key" in lowered or "authentication_error" in lowered:
+        return "Anthropic API-nøglen blev afvist — tjek ANTHROPIC_API_KEY."
+    if "rate_limit" in lowered or getattr(error, "status_code", None) == 429:
+        return "Anthropic API er overbelastet lige nu. Prøv importen igen om lidt."
+    return text[:300]
+
+
 async def extract_products_with_ai(
     pdf_text: str,
     existing_tags: list[str],
@@ -497,6 +553,11 @@ FAKTURA-TEKST (supplement til billederne):
             )
             break
         except Exception as e:
+            if not is_retryable_api_error(e):
+                # A spend cap or a rejected key will fail the same way every
+                # time; retrying only delays the report.
+                logger.error(f"Claude API call failed and is not retryable: {e}")
+                raise
             if attempt == max_retries - 1:
                 raise
             wait_time = 2 ** attempt  # 1, 2, 4 seconds
