@@ -39,6 +39,29 @@ function StatusTooltip({ warnings, children }: { warnings: string[]; children: R
   );
 }
 
+/* ─── SKU ─── */
+
+/**
+ * The SKU the Shopify push will actually write.
+ *
+ * Source of truth: backend/app/services/shopify_service.py
+ *   sku = f"{style_code}-{var_size}" if style_code else var_size
+ *
+ * Keep this in step with that line — showing anything else here means the
+ * reviewer approves one SKU and Shopify receives another.
+ */
+function buildVariantSku(styleCode: string, size: string): string {
+  const code = (styleCode || "").trim();
+  const variantSize = (size || "").trim();
+  return code ? `${code}-${variantSize}` : variantSize;
+}
+
+/**
+ * A product with no variants is not pushed as-is: shopify_service falls back to
+ * a single "One Size" variant, so that is the size its SKU ends up carrying.
+ */
+const PUSH_FALLBACK_SIZE = "One Size";
+
 /* ─── Types ─── */
 
 interface FlatVariant {
@@ -48,6 +71,7 @@ interface FlatVariant {
   styleCode: string;
   color: string;
   size: string;
+  sku: string;
   quantity: number;
   costPriceEur: number | null;
   retailPriceDkk: number | null;
@@ -157,6 +181,7 @@ export function ReviewTable({
           styleCode: product.style_code,
           color: product.color,
           size: "-",
+          sku: buildVariantSku(product.style_code, PUSH_FALLBACK_SIZE),
           quantity: 0,
           costPriceEur: product.cost_price_eur,
           retailPriceDkk: product.retail_price_dkk,
@@ -174,6 +199,7 @@ export function ReviewTable({
             styleCode: product.style_code,
             color: product.color,
             size: variant.size,
+            sku: buildVariantSku(product.style_code, variant.size),
             quantity: variant.quantity,
             costPriceEur: product.cost_price_eur,
             retailPriceDkk: product.retail_price_dkk,
@@ -308,13 +334,7 @@ export function ReviewTable({
             lastProductId = row.productId;
             const isSelected = selectedIds.has(row.productId);
 
-            const skuParts = [
-              row.vendor?.substring(0, 3).toUpperCase() || "---",
-              row.styleCode || "0000",
-              row.color?.substring(0, 3).toUpperCase() || "---",
-              row.size,
-            ];
-            const sku = skuParts.join("-");
+            const sku = row.sku;
 
             return (
               <tr
