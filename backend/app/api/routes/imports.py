@@ -9,7 +9,7 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
@@ -23,10 +23,10 @@ from app.models.import_record import Import
 from app.models.import_file import ImportFile
 from app.models.import_product import ImportProduct
 from app.services.pdf_service import extract_pdf_text, extract_pdf_pages_as_images
-from app.services.invoice_parser import parse_invoice_tables
+from app.services.invoice_parser import parse_invoice_metadata, parse_invoice_tables
 from app.models.brand import Brand
 from app.models.product_image import ProductImage
-from app.services.ai_extractor import extract_products_with_ai
+from app.services.ai_extractor import extract_products_with_ai, normalize_season
 from app.services.image_service import (
     find_product_images_and_details,
     get_cached_images,
@@ -333,6 +333,8 @@ async def get_import(
         "products_pushed": imp.products_pushed,
         "eur_rate": imp.eur_rate,
         "markup": imp.markup,
+        "invoice_number": imp.invoice_number,
+        "invoice_date": imp.invoice_date.isoformat() if imp.invoice_date else None,
         "error_message": imp.error_message,
         "created_at": imp.created_at.isoformat() if imp.created_at else None,
         "completed_at": imp.completed_at.isoformat() if imp.completed_at else None,
@@ -374,6 +376,10 @@ async def get_import(
                 "duplicate_import_date": p.duplicate_import_date,
                 "seo_keywords": p.seo_keywords or [],
                 "qa_warnings": p.qa_warnings or [],
+                "order_number": p.order_number,
+                "invoice_number": p.invoice_number,
+                "season_raw": p.season_raw,
+                "season_normalized": p.season_normalized,
             }
             for p in products
         ],
@@ -608,6 +614,11 @@ async def _run_analysis(import_id: uuid.UUID):
                     # 3. Parse tables
                     table_products = await asyncio.to_thread(parse_invoice_tables, pdf_bytes)
 
+                    # 3b. Invoice header: order/invoice number, date, season.
+                    # Read separately from the tables so it is still available
+                    # when this invoice has no parseable product table.
+                    invoice_meta = await asyncio.to_thread(parse_invoice_metadata, pdf_bytes)
+
                     _emit_event(sid, {
                         "type": "log",
                         "message": f"Fundet tabel med {len(table_products)} produktrækker" if table_products else "Ingen tabeldata fundet, bruger AI-ekstraktion",
@@ -645,6 +656,27 @@ async def _run_analysis(import_id: uuid.UUID):
                         "message": f"AI fandt {len(ai_products)} produkter i {fname}",
                         "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
                     })
+
+                    # 4a. Backfill order/invoice/season from the invoice header for
+                    # products the deterministic parser never saw. Values already
+                    # present (parser first, then AI) are left alone.
+                    for p in ai_products:
+                        for meta_key in ("order_number", "invoice_number", "invoice_date"):
+                            if invoice_meta.get(meta_key) and not p.get(meta_key):
+                                p[meta_key] = invoice_meta[meta_key]
+                        if invoice_meta.get("season_raw") and not p.get("season_raw"):
+                            p["season_raw"] = invoice_meta["season_raw"]
+                            p["season_normalized"] = normalize_season(invoice_meta["season_raw"])
+
+                    if invoice_meta.get("invoice_number") and not imp.invoice_number:
+                        imp.invoice_number = invoice_meta["invoice_number"][:100]
+                    if invoice_meta.get("invoice_date") and not imp.invoice_date:
+                        try:
+                            imp.invoice_date = date.fromisoformat(invoice_meta["invoice_date"])
+                        except ValueError:
+                            logger.warning(
+                                f"Unparseable invoice date {invoice_meta['invoice_date']!r} in {fname}"
+                            )
 
                     # 4b. Lookup brand-specific config (markup + image scraping) for all vendors
                     unique_vendors = {p.get("vendor", "").strip() for p in ai_products if p.get("vendor")}
@@ -1190,6 +1222,10 @@ async def _run_analysis(import_id: uuid.UUID):
                     material=p.get("material", ""),
                     gender=p.get("gender", ""),
                     season=p.get("season", ""),
+                    season_raw=p.get("season_raw") or None,
+                    season_normalized=p.get("season_normalized") or None,
+                    order_number=(p.get("order_number") or None),
+                    invoice_number=(p.get("invoice_number") or None),
                     country_of_origin=p.get("country_of_origin", ""),
                     hs_code=p.get("hs_code", ""),
                     description_en=p.get("details_en") or p.get("_description_en_scraped") or "",

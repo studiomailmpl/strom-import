@@ -18,6 +18,97 @@ from app.services.pdf_service import detect_invoice_currency
 DEFAULT_EUR_TO_DKK = 7.46
 
 
+# ---------------------------------------------------------------------------
+# Invoice header metadata — order number, invoice number, date, season
+# ---------------------------------------------------------------------------
+
+# Anchored on the document word, so "VAT N°", "Customer N°", "BL client N°"
+# and "SH.N°" can never be mistaken for an invoice or order number.
+# The value may sit on the next line: A.P.C. renders "Order N° :\n1000067897".
+_NUM_TAIL = r"\s*(?:N[o°˚]|Nr|No)\.?\s*:?\s*\n?\s*([A-Z0-9][A-Z0-9/-]{3,})"
+
+_INVOICE_NO_RE = re.compile(
+    r"(?:Facture|Invoice|Rechnung|Faktura)" + _NUM_TAIL, re.IGNORECASE
+)
+_ORDER_NO_RE = re.compile(
+    r"(?:Commande|Order|Ordre|Auftrag|Bestellung)" + _NUM_TAIL, re.IGNORECASE
+)
+
+_DATE = r"(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})"
+# Invoice dates are written day-first on every European invoice we handle.
+_INVOICE_DATE_RES = [
+    re.compile(r"Invoice\s+date\s*:?\s*" + _DATE, re.IGNORECASE),
+    re.compile(r"Facture\s*(?:N[o°˚]|Nr|No)\.?\s*\S+\s+du\s+" + _DATE, re.IGNORECASE),
+    re.compile(r"(?:Date\s+de\s+facture|Fakturadato|Rechnungsdatum)\s*:?\s*" + _DATE, re.IGNORECASE),
+]
+
+# A season value always ends in a year, so stop the capture there rather than
+# running on into the rest of the line: "COLLECTION SS26 ORDER" must yield
+# "SS26", not "SS26 ORDER". The character class excludes newlines, keeping the
+# match on one line.
+_SEASON_RE = re.compile(
+    r"(?:Saison|Season|Collection)\s*:?\s*([A-Za-z][A-Za-z /-]{0,20}?\s?\d{2,4})\b",
+    re.IGNORECASE,
+)
+
+
+def _to_iso_date(day: str, month: str, year: str) -> str:
+    """Convert a day-first European date to ISO YYYY-MM-DD, or "" if invalid."""
+    try:
+        d, m, y = int(day), int(month), int(year)
+    except (TypeError, ValueError):
+        return ""
+    if y < 100:
+        y += 2000
+    if not (1 <= d <= 31 and 1 <= m <= 12 and 2000 <= y <= 2099):
+        return ""
+    return f"{y:04d}-{m:02d}-{d:02d}"
+
+
+def extract_invoice_metadata(full_text: str) -> dict:
+    """
+    Pull the invoice header fields out of the raw PDF text.
+
+    Returns a dict with "order_number", "invoice_number", "invoice_date"
+    (ISO YYYY-MM-DD) and "season_raw". Missing fields come back as "".
+    """
+    meta = {"order_number": "", "invoice_number": "", "invoice_date": "", "season_raw": ""}
+    if not full_text:
+        return meta
+
+    invoice_match = _INVOICE_NO_RE.search(full_text)
+    if invoice_match:
+        meta["invoice_number"] = invoice_match.group(1).strip()
+
+    order_match = _ORDER_NO_RE.search(full_text)
+    if order_match:
+        meta["order_number"] = order_match.group(1).strip()
+
+    for pattern in _INVOICE_DATE_RES:
+        date_match = pattern.search(full_text)
+        if date_match:
+            iso = _to_iso_date(*date_match.groups())
+            if iso:
+                meta["invoice_date"] = iso
+                break
+
+    season_match = _SEASON_RE.search(full_text)
+    if season_match:
+        meta["season_raw"] = season_match.group(1).strip()
+
+    return meta
+
+
+def parse_invoice_metadata(pdf_bytes: bytes) -> dict:
+    """Open a PDF and return its invoice header metadata."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        full_text = "".join(page.get_text() + "\n" for page in doc)
+    finally:
+        doc.close()
+    return extract_invoice_metadata(full_text)
+
+
 def parse_invoice_tables(pdf_bytes: bytes, eur_to_dkk: float = DEFAULT_EUR_TO_DKK) -> list[dict]:
     """
     Parse product lines from invoice PDF.
@@ -43,6 +134,14 @@ def parse_invoice_tables(pdf_bytes: bytes, eur_to_dkk: float = DEFAULT_EUR_TO_DK
         # If tables didn't work, try text-based parsing
         if not products:
             products = _parse_text_based(full_text, currency, eur_to_dkk)
+
+        # Fill order/invoice/season from the document header wherever a
+        # per-product parser did not find its own value.
+        meta = extract_invoice_metadata(full_text)
+        for product in products:
+            for key, value in meta.items():
+                if value and not product.get(key):
+                    product[key] = value
 
         return products
     finally:
@@ -104,12 +203,26 @@ def _parse_american_vintage_table(
             continue
 
         designation = cells[1] if len(cells) > 1 else ""
+        row_order_no = ""
+        row_invoice_no = ""
         if designation:
             lines = designation.split("\n")
             clean_lines = []
             for line in lines:
                 line_strip = line.strip()
                 if any(skip in line_strip for skip in ["BL client", "Commande", "Facture", "N°"]):
+                    # These reference lines are not part of the product name, but
+                    # they carry the order and invoice numbers for this row:
+                    #   "Commande N° 2602129660 du 11/02/2026"
+                    #   "Facture N° 26046761 du 24/04/2026"
+                    if not row_order_no:
+                        order_match = _ORDER_NO_RE.search(line_strip)
+                        if order_match:
+                            row_order_no = order_match.group(1).strip()
+                    if not row_invoice_no:
+                        invoice_match = _INVOICE_NO_RE.search(line_strip)
+                        if invoice_match:
+                            row_invoice_no = invoice_match.group(1).strip()
                     continue
                 if line_strip:
                     clean_lines.append(line_strip)
@@ -204,6 +317,8 @@ def _parse_american_vintage_table(
                     "total_qty": total_qty or sum(v["quantity"] for v in variants),
                     "variants": variants,
                     "currency_detected": currency,
+                    "order_number": row_order_no,
+                    "invoice_number": row_invoice_no,
                 })
 
     return products
@@ -314,6 +429,10 @@ def _parse_apc_table(
 
     cost_eur = cost / eur_to_dkk if currency == "DKK" else cost
 
+    # A.P.C. repeats the order and invoice reference on every page, rendered as
+    # "Order N° :" with the number on the following line.
+    page_meta = extract_invoice_metadata(page_text)
+
     return {
         "style_code": style_code,
         "designation": designation,
@@ -324,6 +443,8 @@ def _parse_apc_table(
         "material_raw": material,
         "origin": origin,
         "currency_detected": currency,
+        "order_number": page_meta["order_number"],
+        "invoice_number": page_meta["invoice_number"],
     }
 
 
@@ -378,6 +499,7 @@ def _parse_carhartt_text(full_text: str, currency: str, eur_to_dkk: float) -> li
 
     # Find product data by locating SKU patterns
     # Carhartt SKU format: letter + 6 digits (e.g. I036159)
+    last_order_no = ""
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -387,7 +509,11 @@ def _parse_carhartt_text(full_text: str, currency: str, eur_to_dkk: float) -> li
             sku = line
             # Read surrounding lines
             # Previous line should be order number, next lines: color, name, qty, price
-            order_no = lines[i - 1] if i > 0 else ""  # noqa: F841
+            prev_line = lines[i - 1] if i > 0 else ""
+            # Carhartt order numbers look like "25VA051691" — only accept the
+            # previous line when it actually matches, since the line above the
+            # first SKU on a page is a table header, not an order number.
+            order_no = prev_line if re.match(r'^\d{2}[A-Z]{2}\d+$', prev_line) else ""
             color_code = lines[i + 1] if i + 1 < len(lines) else ""
             name = lines[i + 2] if i + 2 < len(lines) else ""
             qty_str = lines[i + 3] if i + 3 < len(lines) else ""
@@ -409,6 +535,13 @@ def _parse_carhartt_text(full_text: str, currency: str, eur_to_dkk: float) -> li
 
             cost_eur = unit_price / eur_to_dkk if currency == "DKK" else unit_price
 
+            # An order number heads a block of products and is not repeated on
+            # every line, so carry the last one seen forward.
+            if order_no:
+                last_order_no = order_no
+            else:
+                order_no = last_order_no
+
             current_product: dict = {
                 "style_code": sku,
                 "designation": name,
@@ -418,6 +551,7 @@ def _parse_carhartt_text(full_text: str, currency: str, eur_to_dkk: float) -> li
                 "variants": [],  # No size breakdown in Carhartt invoices
                 "currency_detected": currency,
                 "needs_size_lookup": True,
+                "order_number": order_no,
             }
 
             # Scan following lines for supplementary info (material, HS code, origin)

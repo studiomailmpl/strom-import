@@ -1,9 +1,12 @@
 """add drive_connections table
 
 Revision ID: b133d2455206
-Revises: t0u1v2w3x4y5
+Revises: a420ba03447f
 Create Date: 2026-08-31 13:52:46.713901
 
+Originally generated against t0u1v2w3x4y5. Re-chained onto a420ba03447f when
+the order/season branch and the Drive branch were brought together, so the
+history stays a single line — both were still unapplied at that point.
 """
 from typing import Sequence, Union
 
@@ -13,7 +16,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = 'b133d2455206'
-down_revision: Union[str, None] = 't0u1v2w3x4y5'
+down_revision: Union[str, None] = 'a420ba03447f'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
