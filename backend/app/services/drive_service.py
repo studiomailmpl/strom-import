@@ -484,6 +484,30 @@ def _download_sync(client, file_id: str) -> bytes:
     return client.files().get_media(fileId=file_id).execute()
 
 
+def _get_file_metadata_sync(client, file_id: str) -> dict:
+    return client.files().get(
+        fileId=file_id,
+        fields="id, name, mimeType, modifiedTime, size",
+        supportsAllDrives=True,
+    ).execute()
+
+
+async def get_file_metadata(
+    db: AsyncSession, org_id: uuid.UUID, file_id: str
+) -> dict | None:
+    """
+    Fetch a Drive file's name, MIME type and modifiedTime.
+
+    The modifiedTime is what the order-confirmation cache keys on, so this is
+    called before deciding whether a re-parse is needed.
+    """
+    access_token = await get_valid_access_token(db, org_id)
+    if not access_token:
+        return None
+    client = build_drive_client(access_token)
+    return await asyncio.to_thread(_get_file_metadata_sync, client, file_id)
+
+
 async def download_file(
     db: AsyncSession, org_id: uuid.UUID, file_id: str
 ) -> bytes | None:

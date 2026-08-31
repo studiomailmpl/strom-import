@@ -330,3 +330,109 @@ async def set_root_folder(
         root_folder_id=connection.root_folder_id or None,
         connected_at=connection.connected_at.isoformat() if connection.connected_at else None,
     )
+
+
+# ═══════════════════════════════════════════════
+# Order confirmations
+# ═══════════════════════════════════════════════
+
+@router.post("/drive/parse/{file_id}")
+async def parse_drive_file(
+    file_id: str,
+    force: bool = Query(False, description="Re-parse even if the cached parse is current"),
+    user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Download a Drive file, parse it as an order confirmation, store it and
+    return the result.
+
+    A parse is reused when Drive reports the same modifiedTime as the stored
+    one — parsing a PDF costs a Claude Vision call. Pass force=true to override.
+    """
+    from app.services.drive_service import download_file, get_file_metadata
+    from app.services.order_confirmation_parser import (
+        UnsupportedFileType,
+        parse_order_confirmation,
+    )
+    from app.services.order_confirmation_store import (
+        get_cached_confirmation,
+        save_confirmation,
+        serialise_confirmation,
+    )
+
+    metadata = await get_file_metadata(db, user.organisation_id, file_id)
+    if metadata is None:
+        raise HTTPException(status_code=400, detail="Google Drive er ikke forbundet")
+
+    file_name = metadata.get("name", "")
+    mime_type = metadata.get("mimeType", "")
+    modified_time = metadata.get("modifiedTime")
+
+    if not force:
+        cached = await get_cached_confirmation(
+            db, user.organisation_id, file_id, modified_time
+        )
+        if cached is not None:
+            logger.info("Order confirmation %s served from cache", file_id)
+            return {"cached": True, **serialise_confirmation(cached)}
+
+    file_bytes = await download_file(db, user.organisation_id, file_id)
+    if file_bytes is None:
+        raise HTTPException(status_code=400, detail="Google Drive er ikke forbundet")
+
+    settings = get_settings()
+    try:
+        parsed = await parse_order_confirmation(
+            file_bytes,
+            file_name,
+            mime_type,
+            api_key=settings.anthropic_api_key,
+        )
+    except UnsupportedFileType as e:
+        raise HTTPException(status_code=415, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    confirmation = await save_confirmation(
+        db, user.organisation_id, file_id, modified_time, file_name, parsed
+    )
+    await db.commit()
+
+    logger.info(
+        "Parsed order confirmation %s (%s) — %d line(s) via %s",
+        file_name, file_id, len(parsed.lines), parsed.source,
+    )
+    return {
+        "cached": False,
+        "source": parsed.source,
+        **serialise_confirmation(confirmation),
+    }
+
+
+@router.get("/drive/order-confirmations")
+async def list_order_confirmations(
+    limit: int = Query(50, ge=1, le=200),
+    user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List the order confirmations parsed for this organisation, newest first."""
+    from app.models.order_confirmation import OrderConfirmation
+    from app.services.order_confirmation_store import serialise_confirmation
+
+    result = await db.execute(
+        select(OrderConfirmation)
+        .where(OrderConfirmation.organisation_id == user.organisation_id)
+        .order_by(OrderConfirmation.parsed_at.desc())
+        .limit(limit)
+    )
+    confirmations = result.scalars().all()
+
+    return {
+        "total": len(confirmations),
+        # Line rows are omitted here — the list view only needs the headers,
+        # and loading every line for every confirmation would be wasteful.
+        "confirmations": [
+            serialise_confirmation(c, include_lines=False) for c in confirmations
+        ],
+    }
