@@ -1,9 +1,93 @@
 "use client";
 
 import { useState, useMemo, type ReactNode } from "react";
-import { Check, AlertTriangle, XCircle, Package } from "lucide-react";
+import { Check, AlertTriangle, XCircle, Package, FileCheck2, Link2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import type { ImportProduct, ProductVariant } from "./product-card";
+
+/* ─── Order confirmation match ─── */
+
+/**
+ * A match this strong is treated as verified; below it the confirmation was
+ * matched on a weaker signal (a fuzzy title, a colour code) and is worth a
+ * human glance before the data is trusted.
+ */
+const CONFIDENT_MATCH = 90;
+
+type MatchState = "matched" | "uncertain" | "unmatched";
+
+function matchState(product: ImportProduct): MatchState {
+  if (!product.order_confirmation_line_id) return "unmatched";
+  return (product.match_confidence ?? 0) >= CONFIDENT_MATCH ? "matched" : "uncertain";
+}
+
+/** Human labels for the merge policy's source values. */
+const SOURCE_LABELS: Record<string, string> = {
+  order_confirmation: "Ordrebekræftelse",
+  invoice: "Faktura",
+  web: "Web",
+  manual: "Manuelt",
+};
+
+const FIELD_LABELS: Record<string, string> = {
+  style_code: "Varenummer",
+  title: "Titel",
+  color_code: "Farvekode",
+  color_original: "Farve (original)",
+  size_range: "Størrelser",
+  quantity: "Antal",
+  cost_price_eur: "Kostpris",
+  rrp: "Vejl. udsalgspris",
+  images: "Billeder",
+  description_da: "Beskrivelse",
+};
+
+/** Tooltip listing which source won each field. */
+function DataSourceTooltip({ sources }: { sources: Record<string, string> }) {
+  const [show, setShow] = useState(false);
+  const entries = Object.entries(sources);
+  if (entries.length === 0) return null;
+
+  return (
+    <span
+      className="relative inline-flex"
+      onMouseEnter={() => setShow(true)}
+      onMouseLeave={() => setShow(false)}
+    >
+      <FileCheck2
+        className="h-3.5 w-3.5 cursor-help"
+        style={{ color: "var(--text-tertiary)" }}
+      />
+      {show && (
+        <span
+          className="absolute right-0 top-full mt-1.5 z-50 w-56 rounded-[var(--radius-md)] px-3 py-2"
+          style={{
+            background: "var(--bg-primary)",
+            border: "1px solid var(--border-primary)",
+            boxShadow: "var(--shadow-md)",
+          }}
+        >
+          <span
+            className="mb-1 block text-[10px] font-medium uppercase tracking-[0.05em]"
+            style={{ color: "var(--text-tertiary)" }}
+          >
+            Datakilde pr. felt
+          </span>
+          {entries.map(([field, source]) => (
+            <span key={field} className="flex justify-between gap-2 text-[11px]">
+              <span style={{ color: "var(--text-secondary)" }}>
+                {FIELD_LABELS[field] || field}
+              </span>
+              <span style={{ color: "var(--text-primary)" }}>
+                {SOURCE_LABELS[source] || source}
+              </span>
+            </span>
+          ))}
+        </span>
+      )}
+    </span>
+  );
+}
 
 /* ─── Tooltip ─── */
 
@@ -134,6 +218,12 @@ interface ReviewTableProps {
   onToggleSelect: (productId: string) => void;
   onToggleAll: () => void;
   readOnly?: boolean;
+  /** Let the user point an unmatched product at an order confirmation in Drive.
+   *  Omit to hide the match column entirely. */
+  onLinkOrderConfirmation?: (productId: string) => void;
+  /** Show the match column even without a link handler — the history view has
+   *  nothing to link, but still wants to show what was matched. */
+  showMatchColumn?: boolean;
 }
 
 /* ─── Component ─── */
@@ -144,7 +234,15 @@ export function ReviewTable({
   onToggleSelect,
   onToggleAll,
   readOnly = false,
+  onLinkOrderConfirmation,
+  showMatchColumn,
 }: ReviewTableProps) {
+  // Show the column when asked to, when a link handler exists, or whenever any
+  // product actually carries match data — otherwise it is dead space.
+  const withMatchColumn =
+    showMatchColumn ??
+    (Boolean(onLinkOrderConfirmation) ||
+      products.some((p) => p.order_confirmation_line_id || p.data_sources));
   const flatVariants = useMemo(() => {
     const rows: FlatVariant[] = [];
     for (const product of products) {
@@ -218,6 +316,54 @@ export function ReviewTable({
           </StatusTooltip>
         );
     }
+  };
+
+  const matchBadge = (product: ImportProduct) => {
+    const state = matchState(product);
+    const confidence = product.match_confidence ?? 0;
+    const sources = product.data_sources || {};
+
+    if (state === "unmatched") {
+      return (
+        <div className="flex items-center gap-1.5">
+          <Badge variant="error" className="gap-1">
+            <XCircle className="h-3 w-3" />
+            Ingen match
+          </Badge>
+          {!readOnly && onLinkOrderConfirmation && (
+            <button
+              onClick={() => onLinkOrderConfirmation(product.id)}
+              title="Peg på den rigtige ordrebekræftelse i Drive"
+              className="inline-flex items-center gap-1 rounded-[var(--radius-sm)] px-1.5 py-1 text-[11px] transition-colors"
+              style={{
+                color: "var(--text-secondary)",
+                border: "1px solid var(--border-primary)",
+              }}
+            >
+              <Link2 className="h-3 w-3" />
+              Link
+            </button>
+          )}
+        </div>
+      );
+    }
+
+    return (
+      <div className="flex items-center gap-1.5">
+        {state === "matched" ? (
+          <Badge variant="success" className="gap-1">
+            <Check className="h-3 w-3" />
+            Matchet {confidence}%
+          </Badge>
+        ) : (
+          <Badge variant="warning" className="gap-1">
+            <AlertTriangle className="h-3 w-3" />
+            Usikkert {confidence}%
+          </Badge>
+        )}
+        <DataSourceTooltip sources={sources} />
+      </div>
+    );
   };
 
   if (products.length === 0) {
@@ -300,6 +446,14 @@ export function ReviewTable({
             >
               Status
             </th>
+            {withMatchColumn && (
+              <th
+                className="px-4 py-3 text-left text-[11px] font-medium uppercase tracking-[0.05em]"
+                style={{ color: "var(--text-tertiary)" }}
+              >
+                Ordrebekræftelse
+              </th>
+            )}
           </tr>
         </thead>
         <tbody>
@@ -406,6 +560,12 @@ export function ReviewTable({
                     : "\u2014"}
                 </td>
                 <td className="px-4 py-3">{statusBadge(row.status, row.warnings)}</td>
+                {withMatchColumn && (
+                  <td className="px-4 py-3">
+                    {/* One badge per product, not per variant row. */}
+                    {showTitle && matchBadge(row.product)}
+                  </td>
+                )}
               </tr>
             );
           })}

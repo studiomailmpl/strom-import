@@ -422,3 +422,85 @@ class TestGroupLinesByMatch:
         assert {v["size"]: v["quantity"] for v in p.variants} == {"M": 4, "L": 0}
         assert outcome.warnings == []
         assert p.data_sources["rrp"] == om.SOURCE_ORDER_CONFIRMATION
+
+
+# ═══════════════════════════════════════════════
+# ProductProxy — the bridge to the pipeline's dicts
+# ═══════════════════════════════════════════════
+
+class TestProductProxy:
+    def test_reads_attributes_from_the_dict(self):
+        proxy = om.ProductProxy({"style_code": "ABC123", "color": "210 Blue"})
+        assert proxy.style_code == "ABC123"
+        assert proxy.color == "210 Blue"
+
+    def test_missing_keys_read_as_none(self):
+        assert om.ProductProxy({}).style_code is None
+
+    def test_writes_go_back_into_the_same_dict(self):
+        data = {"style_code": "old"}
+        proxy = om.ProductProxy(data)
+        proxy.style_code = "new"
+        assert data["style_code"] == "new", "the pipeline must see the merge"
+
+    def test_a_dict_without_an_id_gets_a_stable_synthetic_one(self):
+        proxy = om.ProductProxy({})
+        assert proxy.id is not None
+        assert proxy.id == proxy.id
+
+    def test_two_proxies_get_different_ids(self):
+        assert om.ProductProxy({}).id != om.ProductProxy({}).id
+
+    def test_an_existing_id_is_respected(self):
+        existing = uuid.uuid4()
+        assert om.ProductProxy({"id": existing}).id == existing
+
+    def test_matching_works_on_dicts(self):
+        data = {"style_code": "ABC123", "vendor": "Marni", "color": "210 Blue"}
+        proxy = om.ProductProxy(data)
+        results = om.match_products_to_order_lines([proxy], [line(style_number="ABC123")])
+        assert len(results) == 1
+        assert results[0].product_id == proxy.id
+        assert results[0].confidence == 100
+
+    def test_merging_writes_the_whole_policy_into_the_dict(self):
+        data = {
+            "style_code": "abc-123",
+            "title": "ABC123",
+            "color": "210 Blue",
+            "cost_price_eur": 82.44,
+            "variants": [{"size": "M", "quantity": 4}],
+            "qa_warnings": [],
+            "data_sources": {},
+        }
+        proxy = om.ProductProxy(data)
+        sizes = [
+            line(style_number="ABC123", color_code="210", size="M",
+                 product_name="Mello Knit Shirt", wholesale_price=82.44, rrp=199.0),
+            line(style_number="ABC123", color_code="210", size="L",
+                 product_name="Mello Knit Shirt", wholesale_price=82.44, rrp=199.0),
+        ]
+
+        matches = om.match_products_to_order_lines([proxy], sizes)
+        grouped = om.group_lines_by_match(matches, sizes)
+        om.merge_with_order_data(proxy, grouped[proxy.id], match=matches[0])
+
+        # Everything lands in the plain dict the pipeline will save from.
+        assert data["title"] == "Mello Knit Shirt"
+        assert data["style_code"] == "ABC123"
+        assert data["match_confidence"] == 90
+        assert data["match_method"] == om.METHOD_NORMALIZED
+        assert data["order_confirmation_line_id"] == matches[0].order_line_id
+        assert data["data_sources"]["rrp"] == om.SOURCE_ORDER_CONFIRMATION
+        assert {v["size"]: v["quantity"] for v in data["variants"]} == {"M": 4, "L": 0}
+
+    def test_cost_warning_appends_to_the_dicts_qa_warnings(self):
+        data = {"style_code": "A", "cost_price_eur": 100.0, "qa_warnings": [
+            {"level": "info", "code": "existing", "field": "x", "message": "keep me"}
+        ]}
+        proxy = om.ProductProxy(data)
+        om.merge_with_order_data(proxy, [line(style_number="A", wholesale_price=120.0)])
+
+        codes = [w["code"] for w in data["qa_warnings"]]
+        assert "existing" in codes, "existing warnings must survive"
+        assert "cost_mismatch_order_confirmation" in codes

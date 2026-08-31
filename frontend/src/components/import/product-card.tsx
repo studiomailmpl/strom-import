@@ -69,6 +69,13 @@ export interface ImportProduct {
   duplicate_import_date: string | null;
   seo_keywords?: (SEOKeyword | string)[];
   qa_warnings?: QAWarning[];
+  // Order confirmation match — set when the product was verified against a
+  // confirmation from Drive rather than resting on invoice data alone.
+  order_confirmation_line_id?: string | null;
+  match_confidence?: number | null;
+  match_method?: string | null;
+  /** Which source won each field, e.g. { rrp: "order_confirmation" }. */
+  data_sources?: Record<string, string> | null;
 }
 
 export interface QAWarning {

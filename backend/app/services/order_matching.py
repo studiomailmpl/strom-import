@@ -54,6 +54,36 @@ class MatchResult:
     match_method: str
 
 
+class ProductProxy:
+    """
+    Attribute access over a product dict.
+
+    The import pipeline carries products as plain dicts until they are saved,
+    while matching and merging are written against ImportProduct rows. This
+    bridges the two rather than duplicating either. Reads and writes go straight
+    through to the underlying dict, so merging a proxy updates the pipeline's
+    product in place.
+
+    Dicts have no primary key yet, so the proxy carries a synthetic id purely to
+    correlate MatchResults back to products.
+    """
+
+    def __init__(self, data: dict):
+        object.__setattr__(self, "_data", data)
+        object.__setattr__(self, "_id", data.get("id") or uuid.uuid4())
+
+    def __getattr__(self, name):
+        if name == "id":
+            return self.__dict__["_id"]
+        return self.__dict__["_data"].get(name)
+
+    def __setattr__(self, name, value):
+        self.__dict__["_data"][name] = value
+
+    def __repr__(self) -> str:
+        return f"<ProductProxy {self.__dict__['_data'].get('style_code')}>"
+
+
 @dataclass
 class MergeOutcome:
     """What merge_with_order_data changed, for logging and for the review UI."""

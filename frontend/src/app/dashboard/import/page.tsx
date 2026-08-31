@@ -314,6 +314,60 @@ export default function ImportPage() {
     }
   };
 
+  /* ─── ORDER CONFIRMATION FALLBACK ─── */
+
+  // The automatic search in step 4c missed this one, so the user names the
+  // Drive file. Linking runs against the whole import, so every still-unmatched
+  // product gets a chance at the file, not just the row that was clicked.
+  const handleLinkOrderConfirmation = async () => {
+    if (!importId) return;
+
+    const driveFileId = window.prompt(
+      "Indsæt Google Drive fil-ID for ordrebekræftelsen.\n\n" +
+        "ID'et er den lange del af filens URL i Drive:\n" +
+        "drive.google.com/file/d/<FIL-ID>/view"
+    );
+    if (!driveFileId || !driveFileId.trim()) return;
+
+    try {
+      const token = await getToken();
+      const result = await apiFetch<{
+        file_name: string;
+        lines_parsed: number;
+        matched: number;
+        unmatched: number;
+      }>(`/api/v1/imports/${importId}/link-order-confirmation`, {
+        method: "POST",
+        token: token || undefined,
+        body: JSON.stringify({ drive_file_id: driveFileId.trim() }),
+      });
+
+      if (result.matched > 0) {
+        toast.success(
+          `${result.file_name}: ${result.matched} produkter matchet` +
+            (result.unmatched > 0 ? `, ${result.unmatched} stadig umatchede` : "")
+        );
+      } else {
+        toast.warning(
+          `${result.file_name} blev læst (${result.lines_parsed} linjer), ` +
+            "men ingen produkter matchede"
+        );
+      }
+
+      // Pull the merged data back so the table reflects the new match.
+      const refreshToken = await getToken();
+      const imp = await apiFetch<{ products: ImportProduct[] }>(
+        `/api/v1/imports/${importId}`,
+        { token: refreshToken || undefined }
+      );
+      setProducts(imp.products);
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Kunne ikke linke ordrebekræftelsen"
+      );
+    }
+  };
+
   /* ─── PUSH ─── */
 
   const handlePush = async () => {
@@ -645,6 +699,7 @@ export default function ImportPage() {
               selectedIds={selectedIds}
               onToggleSelect={handleToggleSelect}
               onToggleAll={handleToggleAll}
+              onLinkOrderConfirmation={handleLinkOrderConfirmation}
             />
           </div>
 

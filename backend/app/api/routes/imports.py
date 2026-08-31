@@ -10,9 +10,11 @@ import re
 import time
 import uuid
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth import get_current_user
@@ -26,6 +28,7 @@ from app.services.pdf_service import extract_pdf_text, extract_pdf_pages_as_imag
 from app.services.invoice_parser import parse_invoice_metadata, parse_invoice_tables
 from app.models.brand import Brand
 from app.models.product_image import ProductImage
+from app.models.order_confirmation import OrderConfirmationLine
 from app.services.ai_extractor import extract_products_with_ai, normalize_season
 from app.services.image_service import (
     find_product_images_and_details,
@@ -81,6 +84,149 @@ def _emit_event(import_id: str, event: dict) -> None:
     # Prune oldest events if we exceed the cap (keep terminal events like done/error)
     if len(events) > _MAX_EVENTS_PER_IMPORT:
         _analysis_progress[import_id] = events[-_MAX_EVENTS_PER_IMPORT:]
+
+
+async def _load_order_confirmation_lines(db, org_id, candidate):
+    """
+    Get the parsed lines for a Drive candidate, reusing the stored parse when
+    Drive reports the file unchanged. Returns (confirmation, lines).
+    """
+    from app.services.drive_service import download_file
+    from app.services.order_confirmation_parser import parse_order_confirmation
+    from app.services.order_confirmation_store import (
+        get_cached_confirmation,
+        save_confirmation,
+    )
+
+    cached = await get_cached_confirmation(
+        db, org_id, candidate.file_id, candidate.modified_time
+    )
+    if cached is not None:
+        return cached, list(cached.lines)
+
+    file_bytes = await download_file(db, org_id, candidate.file_id)
+    if not file_bytes:
+        return None, []
+
+    parsed = await parse_order_confirmation(
+        file_bytes,
+        candidate.name,
+        candidate.mime_type,
+        api_key=settings.anthropic_api_key,
+    )
+    confirmation = await save_confirmation(
+        db, org_id, candidate.file_id, candidate.modified_time, candidate.name, parsed
+    )
+    await db.flush()
+    return confirmation, list(confirmation.lines)
+
+
+async def _match_order_confirmations(db, imp, products: list[dict], sid: str) -> dict:
+    """
+    Step 4c — find each product's order confirmation in Drive and merge it in.
+
+    Products are grouped by vendor + season + order number, since one Drive file
+    covers one such group. Returns counts for the SSE summary.
+
+    The caller treats a failure here as non-fatal: an import must still complete
+    on invoice data alone if Drive is unreachable or nothing is found.
+    """
+    from app.services.drive_service import search_order_confirmations
+    from app.services.order_matching import (
+        ProductProxy,
+        group_lines_by_match,
+        match_products_to_order_lines,
+        merge_with_order_data,
+    )
+
+    groups: dict[tuple[str, str, str], list[dict]] = {}
+    for p in products:
+        vendor = (p.get("vendor") or "").strip()
+        if not vendor:
+            continue
+        key = (
+            vendor.casefold(),
+            (p.get("season_normalized") or p.get("season") or "").strip(),
+            (p.get("order_number") or "").strip(),
+        )
+        groups.setdefault(key, []).append(p)
+
+    matched_total = 0
+    confirmations_found = 0
+
+    for (vendor_key, season, order_number), group in groups.items():
+        vendor = (group[0].get("vendor") or "").strip()
+
+        _emit_event(sid, {
+            "type": "log",
+            "message": f"Søger ordrebekræftelse for {vendor}...",
+            "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        })
+
+        candidates = await search_order_confirmations(
+            db,
+            imp.organisation_id,
+            vendor_name=vendor,
+            order_number=order_number or None,
+            season=season or None,
+            skus=[p.get("style_code") for p in group if p.get("style_code")],
+        )
+        if not candidates:
+            _emit_event(sid, {
+                "type": "log",
+                "message": f"Ingen ordrebekræftelse fundet for {vendor}",
+                "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            })
+            continue
+
+        confirmation, lines = await _load_order_confirmation_lines(
+            db, imp.organisation_id, candidates[0]
+        )
+        if not lines:
+            _emit_event(sid, {
+                "type": "log",
+                "message": f"Kunne ikke læse {candidates[0].name}",
+                "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+            })
+            continue
+
+        confirmations_found += 1
+        _emit_event(sid, {
+            "type": "log",
+            "message": f"Fandt {candidates[0].name} ({len(lines)} linjer)",
+            "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        })
+
+        proxies = [ProductProxy(p) for p in group]
+        matches = match_products_to_order_lines(
+            proxies,
+            lines,
+            vendor=(confirmation.vendor if confirmation else None) or vendor,
+            season=(confirmation.season if confirmation else None) or season or None,
+        )
+        grouped_lines = group_lines_by_match(matches, lines)
+        by_id = {proxy.id: proxy for proxy in proxies}
+
+        for match in matches:
+            proxy = by_id.get(match.product_id)
+            if proxy is None:
+                continue
+            merge_with_order_data(
+                proxy, grouped_lines.get(match.product_id, []), match=match
+            )
+
+        matched_total += len(matches)
+        _emit_event(sid, {
+            "type": "log",
+            "message": f"{len(matches)}/{len(group)} produkter matchet mod {vendor}",
+            "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        })
+
+    return {
+        "matched": matched_total,
+        "total": len(products),
+        "confirmations_found": confirmations_found,
+    }
 
 
 def _derive_name_from_filename(filename: str) -> str:
@@ -322,6 +468,20 @@ async def get_import(
                 "sort_order": img.sort_order,
             })
 
+    # How many distinct order confirmations back this import. Counting the
+    # linked line ids would count sizes, not documents, so resolve the lines to
+    # their parent confirmations.
+    linked_line_ids = [
+        p.order_confirmation_line_id for p in products if p.order_confirmation_line_id
+    ]
+    order_confirmations_found = 0
+    if linked_line_ids:
+        oc_result = await db.execute(
+            select(func.count(func.distinct(OrderConfirmationLine.order_confirmation_id)))
+            .where(OrderConfirmationLine.id.in_(linked_line_ids))
+        )
+        order_confirmations_found = oc_result.scalar() or 0
+
     return {
         "id": str(imp.id),
         "name": imp.name,
@@ -335,6 +495,11 @@ async def get_import(
         "markup": imp.markup,
         "invoice_number": imp.invoice_number,
         "invoice_date": imp.invoice_date.isoformat() if imp.invoice_date else None,
+        # Order confirmation coverage — how much of this import was verified
+        # against an order confirmation rather than resting on invoice data.
+        "matched_count": sum(1 for p in products if p.order_confirmation_line_id),
+        "unmatched_count": sum(1 for p in products if not p.order_confirmation_line_id),
+        "order_confirmations_found": order_confirmations_found,
         "error_message": imp.error_message,
         "created_at": imp.created_at.isoformat() if imp.created_at else None,
         "completed_at": imp.completed_at.isoformat() if imp.completed_at else None,
@@ -380,6 +545,12 @@ async def get_import(
                 "invoice_number": p.invoice_number,
                 "season_raw": p.season_raw,
                 "season_normalized": p.season_normalized,
+                "order_confirmation_line_id": (
+                    str(p.order_confirmation_line_id) if p.order_confirmation_line_id else None
+                ),
+                "match_confidence": p.match_confidence,
+                "match_method": p.match_method,
+                "data_sources": p.data_sources or {},
             }
             for p in products
         ],
@@ -530,6 +701,7 @@ async def _run_analysis(import_id: uuid.UUID):
 
             total_files = len(import_files_data)
             all_products: list[dict] = []
+            order_confirmations_found = 0
 
             # Pre-load brand extraction examples for few-shot AI prompting
             _brand_extraction_examples: dict[str, list[dict]] = {}
@@ -727,6 +899,29 @@ async def _run_analysis(import_id: uuid.UUID):
                                         )
                         except Exception as brand_err:
                             logger.warning(f"Brand config lookup failed: {brand_err}")
+
+                    # 4c. Order confirmation matching — the only source of RRP.
+                    # Deliberately non-fatal: if Drive is unreachable, the file
+                    # is missing or parsing fails, the import must still finish
+                    # on invoice data alone. Products simply stay unmatched.
+                    try:
+                        match_stats = await _match_order_confirmations(
+                            db, imp, ai_products, sid
+                        )
+                        order_confirmations_found += match_stats["confirmations_found"]
+                    except Exception as oc_err:
+                        logger.warning(
+                            f"Order confirmation matching failed for {fname}: {oc_err}",
+                            exc_info=True,
+                        )
+                        _emit_event(sid, {
+                            "type": "log",
+                            "message": (
+                                "Ordrebekræftelses-matching sprang over "
+                                "— fortsætter med fakturadata"
+                            ),
+                            "timestamp": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+                        })
 
                     # 5. Enrich each product — split into sync enrichment + parallel image search
 
@@ -1248,6 +1443,10 @@ async def _run_analysis(import_id: uuid.UUID):
                     duplicate_of_import_id=p.get("_duplicate_of_import_id"),
                     duplicate_import_date=p.get("_duplicate_import_date"),
                     qa_warnings=p.get("qa_warnings", []),
+                    order_confirmation_line_id=p.get("order_confirmation_line_id"),
+                    match_confidence=p.get("match_confidence"),
+                    match_method=p.get("match_method"),
+                    data_sources=p.get("data_sources") or {},
                 )
                 db.add(import_product)
 
@@ -1359,3 +1558,123 @@ async def _run_analysis(import_id: uuid.UUID):
                 imp.status = "failed"
                 imp.error_message = str(e)[:1000]
                 await error_db.commit()
+
+
+# ---------------------------------------------------------------------------
+# POST /{import_id}/link-order-confirmation
+# ---------------------------------------------------------------------------
+class LinkOrderConfirmationRequest(BaseModel):
+    drive_file_id: str = Field(..., min_length=1, max_length=255)
+
+
+@router.post("/{import_id}/link-order-confirmation")
+async def link_order_confirmation(
+    import_id: str,
+    body: LinkOrderConfirmationRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Point an import at a specific order confirmation in Drive.
+
+    The safety net for when the automatic search in step 4c found nothing or
+    picked the wrong file: the user names the file, and it is downloaded,
+    parsed, matched and merged exactly as the pipeline would have done.
+
+    Only products that are not already matched are touched, so re-running this
+    cannot undo a good automatic match. Products already pushed to Shopify are
+    left alone.
+    """
+    from app.services.drive_service import get_file_metadata
+    from app.services.order_matching import (
+        group_lines_by_match,
+        match_products_to_order_lines,
+        merge_with_order_data,
+    )
+
+    try:
+        import_uuid = uuid.UUID(import_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid import ID format")
+
+    result = await db.execute(
+        select(Import).where(
+            Import.id == import_uuid,
+            Import.organisation_id == user.organisation_id,
+        )
+    )
+    imp = result.scalar_one_or_none()
+    if not imp:
+        raise HTTPException(status_code=404, detail="Import ikke fundet")
+
+    metadata = await get_file_metadata(db, user.organisation_id, body.drive_file_id)
+    if metadata is None:
+        raise HTTPException(status_code=400, detail="Google Drive er ikke forbundet")
+
+    candidate = SimpleNamespace(
+        file_id=body.drive_file_id,
+        name=metadata.get("name", ""),
+        mime_type=metadata.get("mimeType", ""),
+        modified_time=metadata.get("modifiedTime"),
+    )
+
+    try:
+        confirmation, lines = await _load_order_confirmation_lines(
+            db, user.organisation_id, candidate
+        )
+    except Exception as e:
+        logger.error(f"Could not parse order confirmation {body.drive_file_id}: {e}")
+        raise HTTPException(status_code=422, detail=f"Kunne ikke læse filen: {e}")
+
+    if not lines:
+        raise HTTPException(
+            status_code=422,
+            detail="Ingen produktlinjer fundet i ordrebekræftelsen",
+        )
+
+    products_result = await db.execute(
+        select(ImportProduct).where(
+            ImportProduct.import_id == imp.id,
+            ImportProduct.order_confirmation_line_id.is_(None),
+            ImportProduct.status != "pushed",
+        )
+    )
+    products = list(products_result.scalars().all())
+    if not products:
+        return {
+            "file_name": candidate.name,
+            "lines_parsed": len(lines),
+            "matched": 0,
+            "unmatched": 0,
+            "detail": "Alle produkter er allerede matchet",
+        }
+
+    matches = match_products_to_order_lines(
+        products,
+        lines,
+        vendor=(confirmation.vendor if confirmation else None),
+        season=(confirmation.season if confirmation else None),
+    )
+    grouped_lines = group_lines_by_match(matches, lines)
+    by_id = {p.id: p for p in products}
+
+    for match in matches:
+        product = by_id.get(match.product_id)
+        if product is None:
+            continue
+        merge_with_order_data(
+            product, grouped_lines.get(match.product_id, []), match=match
+        )
+
+    await db.commit()
+
+    logger.info(
+        "Linked order confirmation %s to import %s — %d/%d matched",
+        candidate.name, import_id, len(matches), len(products),
+    )
+    return {
+        "file_name": candidate.name,
+        "lines_parsed": len(lines),
+        "matched": len(matches),
+        "unmatched": len(products) - len(matches),
+    }
