@@ -21,7 +21,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.core.config import get_settings
 from app.core.rate_limit import limiter
-from app.api.routes import imports, products, shopify, health, brands, images, seo
+from app.api.routes import imports, products, shopify, health, brands, images, seo, drive
 from app.api.routes.settings import router as settings_router
 
 settings = get_settings()
@@ -156,4 +156,9 @@ app.include_router(
     seo.router,
     prefix=f"/api/{settings.api_version}",
     tags=["seo"],
+)
+app.include_router(
+    drive.router,
+    prefix=f"/api/{settings.api_version}",
+    tags=["drive"],
 )

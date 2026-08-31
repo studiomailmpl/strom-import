@@ -24,6 +24,10 @@ Pillow==11.1.0
 beautifulsoup4==4.12.3
 requests==2.32.3
 
+# Google Drive
+google-auth==2.38.0
+google-api-python-client==2.159.0
+
 # Security
 cryptography==44.0.0
 
