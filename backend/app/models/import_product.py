@@ -89,6 +89,20 @@ class ImportProduct(Base):
     # QA warnings as JSON: [{"level": "warning", "code": "...", "field": "...", "message": "..."}, ...]
     qa_warnings: Mapped[list | None] = mapped_column(JSONB, default=list)
 
+    # Match against a parsed order confirmation line — the only source of RRP.
+    order_confirmation_line_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("order_confirmation_lines.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    match_confidence: Mapped[int | None] = mapped_column(Integer)  # 0-100
+    match_method: Mapped[str | None] = mapped_column(String(50))
+
+    # Which source won each field, e.g. {"rrp": "order_confirmation",
+    # "quantity": "invoice", "images": "web"}. Lets the UI show provenance and
+    # makes a wrong merge traceable after the fact.
+    data_sources: Mapped[dict | None] = mapped_column(JSONB, default=dict)
+
     # User can edit before push
     is_edited: Mapped[bool] = mapped_column(Boolean, default=False)
 

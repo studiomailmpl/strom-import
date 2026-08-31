@@ -19,6 +19,9 @@ PyMuPDF==1.25.3
 # Spreadsheet order confirmations
 openpyxl==3.1.5
 
+# Fuzzy title matching between invoices and order confirmations
+rapidfuzz==3.11.0
+
 # AI
 anthropic==0.42.0
 
