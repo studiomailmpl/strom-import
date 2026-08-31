@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     google_client_secret: str = ""
     google_redirect_uri: str = "http://localhost:8000/api/v1/seo/callback"
 
+    # Google Drive uses the same OAuth client but its own redirect URI —
+    # Google matches the redirect_uri exactly, so each flow needs its own.
+    google_drive_redirect_uri: str = "http://localhost:8000/api/v1/drive/callback"
+
     # DataForSEO (keyword volume + difficulty)
     dataforseo_login: str = ""
     dataforseo_password: str = ""

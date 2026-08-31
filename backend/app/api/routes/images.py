@@ -415,3 +415,56 @@ async def serve_image(request: Request, product_id: str, filename: str):
             "Cache-Control": "public, max-age=86400",
         },
     )
+
+
+@router.get("/images/drive/{vendor}/{sku}/{filename}")
+@limiter.limit("120/minute")
+async def serve_brand_drive_image(
+    request: Request, vendor: str, sku: str, filename: str
+):
+    """
+    Serve a packshot pulled from a brand's Google Drive folder.
+
+    A separate route from serve_image because those images belong to a brand and
+    a SKU, not to a product row — they are fetched during enrichment, before any
+    product has an id. Public for the same reason: Shopify downloads images by
+    URL, and Drive itself is behind OAuth.
+
+    Path segments are re-validated here even though image_service sanitises them
+    on the way in; this route is reachable directly.
+    """
+    for segment in (vendor, sku, filename):
+        if "/" in segment or "\\" in segment or ".." in segment or segment.startswith("."):
+            raise HTTPException(status_code=400, detail="Invalid path")
+
+    ext = Path(filename).suffix.lower()
+    allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
+    if ext not in allowed_extensions:
+        raise HTTPException(status_code=400, detail="Invalid file type")
+
+    image_dir = _get_image_dir()
+    file_path = image_dir / "drive" / vendor / sku / filename
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    # Ensure the resolved path stays inside the image directory (blocks symlinks)
+    resolved = file_path.resolve(strict=True)
+    try:
+        resolved.relative_to(image_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    content_types = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".avif": "image/avif",
+    }
+
+    return FileResponse(
+        path=str(file_path),
+        media_type=content_types.get(ext, "image/jpeg"),
+        headers={"Cache-Control": "public, max-age=86400"},
+    )

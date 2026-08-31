@@ -3,7 +3,7 @@
 import { useState, useEffect, Suspense } from "react";
 import { useAuth } from "@clerk/nextjs";
 import { useSearchParams } from "next/navigation";
-import { ChevronRight, ImageIcon, Search, CheckCircle2, ExternalLink, RefreshCw, BarChart3, Database } from "lucide-react";
+import { ChevronRight, ImageIcon, Search, CheckCircle2, ExternalLink, RefreshCw, BarChart3, Database, FolderOpen } from "lucide-react";
 import Link from "next/link";
 import { apiFetch } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,12 @@ interface SEOStatus {
   total_keywords: number;
   product_types_covered: number;
   dataforseo_configured: boolean;
+}
+
+interface DriveStatus {
+  connected: boolean;
+  root_folder_id: string | null;
+  connected_at: string | null;
 }
 
 export default function SettingsPage() {
@@ -55,6 +61,14 @@ function SettingsPageInner() {
   const [connecting, setConnecting] = useState(false);
   const [syncing, setSyncing] = useState(false);
 
+  // Google Drive state
+  const [driveStatus, setDriveStatus] = useState<DriveStatus | null>(null);
+  const [driveLoading, setDriveLoading] = useState(true);
+  const [driveConnecting, setDriveConnecting] = useState(false);
+  const [driveDisconnecting, setDriveDisconnecting] = useState(false);
+  const [rootFolder, setRootFolder] = useState("");
+  const [rootFolderSaving, setRootFolderSaving] = useState(false);
+
   // DataForSEO state
   const [dfsLogin, setDfsLogin] = useState("");
   const [dfsPassword, setDfsPassword] = useState("");
@@ -71,6 +85,15 @@ function SettingsPageInner() {
     const seoError = searchParams.get("seo_error");
     if (seoError) {
       toast.error(`Search Console fejl: ${seoError}`);
+      window.history.replaceState({}, "", "/dashboard/settings");
+    }
+    if (searchParams.get("drive_connected") === "true") {
+      toast.success("Google Drive forbundet!");
+      window.history.replaceState({}, "", "/dashboard/settings");
+    }
+    const driveError = searchParams.get("drive_error");
+    if (driveError) {
+      toast.error(`Google Drive fejl: ${driveError}`);
       window.history.replaceState({}, "", "/dashboard/settings");
     }
   }, [searchParams]);
@@ -144,6 +167,79 @@ function SettingsPageInner() {
       toast.error("Sync fejlede — tjek at Search Console har data");
     } finally {
       setSyncing(false);
+    }
+  };
+
+  // Fetch Google Drive status
+  useEffect(() => {
+    (async () => {
+      try {
+        const token = await getToken();
+        const data = await apiFetch<DriveStatus>("/api/v1/drive/status", {
+          token: token || undefined,
+        });
+        setDriveStatus(data);
+        setRootFolder(data.root_folder_id || "");
+      } catch {
+        // Not connected yet — that's fine
+        setDriveStatus({ connected: false, root_folder_id: null, connected_at: null });
+      } finally {
+        setDriveLoading(false);
+      }
+    })();
+  }, [getToken]);
+
+  const handleConnectDrive = async () => {
+    setDriveConnecting(true);
+    try {
+      const token = await getToken();
+      const data = await apiFetch<{ auth_url: string }>("/api/v1/drive/connect", {
+        token: token || undefined,
+      });
+      window.open(data.auth_url, "_self");
+    } catch {
+      toast.error("Kunne ikke starte Google Drive-forbindelse");
+      setDriveConnecting(false);
+    }
+  };
+
+  const handleDisconnectDrive = async () => {
+    setDriveDisconnecting(true);
+    try {
+      const token = await getToken();
+      await apiFetch("/api/v1/drive/disconnect", {
+        method: "POST",
+        token: token || undefined,
+      });
+      setDriveStatus({ connected: false, root_folder_id: null, connected_at: null });
+      setRootFolder("");
+      toast.success("Google Drive frakoblet");
+    } catch {
+      toast.error("Kunne ikke frakoble Google Drive");
+    } finally {
+      setDriveDisconnecting(false);
+    }
+  };
+
+  const handleSaveRootFolder = async () => {
+    setRootFolderSaving(true);
+    try {
+      const token = await getToken();
+      const data = await apiFetch<DriveStatus>("/api/v1/drive/set-root-folder", {
+        method: "POST",
+        token: token || undefined,
+        body: JSON.stringify({ root_folder_id: rootFolder.trim() }),
+      });
+      setDriveStatus(data);
+      setRootFolder(data.root_folder_id || "");
+      toast.success(
+        data.root_folder_id ? "Rodmappe gemt" : "Rodmappe ryddet — hele drevet gennemsøges"
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Kunne ikke gemme rodmappen";
+      toast.error(msg);
+    } finally {
+      setRootFolderSaving(false);
     }
   };
 
@@ -384,6 +480,116 @@ function SettingsPageInner() {
             >
               <ExternalLink className="h-3.5 w-3.5 mr-1.5" />
               Forbind Google Search Console
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {/* Google Drive section */}
+      <div className="card mb-6 rounded-[var(--radius-lg)] p-6">
+        <div className="flex items-center gap-3 mb-4">
+          <div
+            className="flex h-10 w-10 items-center justify-center rounded-[var(--radius-lg)]"
+            style={{
+              background: driveStatus?.connected ? "var(--success-light)" : "var(--bg-subdued)",
+            }}
+          >
+            <FolderOpen
+              className="h-5 w-5"
+              style={{
+                color: driveStatus?.connected ? "var(--success)" : "var(--text-tertiary)",
+              }}
+            />
+          </div>
+          <div>
+            <p className="text-[13px] font-medium" style={{ color: "var(--text-primary)" }}>
+              Google Drive
+            </p>
+            <p className="text-[11px]" style={{ color: "var(--text-tertiary)" }}>
+              Forbind Drive så ordrebekræftelser kan bruges som datakilde ved import
+            </p>
+          </div>
+        </div>
+
+        {driveLoading ? (
+          <div className="flex items-center gap-2 py-3">
+            <div
+              className="h-4 w-4 animate-spin rounded-full border-2 border-t-transparent"
+              style={{ borderColor: "var(--border-primary)", borderTopColor: "transparent" }}
+            />
+            <span className="text-[12px]" style={{ color: "var(--text-tertiary)" }}>Henter status...</span>
+          </div>
+        ) : driveStatus?.connected ? (
+          <div>
+            <div
+              className="flex items-center justify-between rounded-[var(--radius-md)] px-3 py-2.5 mb-4"
+              style={{ background: "var(--success-light)" }}
+            >
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="h-4 w-4" style={{ color: "var(--success)" }} />
+                <span className="text-[12px] font-medium" style={{ color: "var(--success)" }}>
+                  Forbundet ✓
+                </span>
+              </div>
+              <button
+                onClick={handleDisconnectDrive}
+                disabled={driveDisconnecting}
+                className="text-[11px] px-2 py-1 rounded-[var(--radius-sm)] transition-colors"
+                style={{ color: "var(--text-tertiary)", background: "transparent" }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.color = "var(--danger)";
+                  e.currentTarget.style.background = "var(--bg-primary)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.color = "var(--text-tertiary)";
+                  e.currentTarget.style.background = "transparent";
+                }}
+              >
+                {driveDisconnecting ? "Frakobler..." : "Frakobl"}
+              </button>
+            </div>
+
+            <div className="mb-3">
+              <label className="mb-1 block text-[11px] font-medium" style={{ color: "var(--text-secondary)" }}>
+                Rodmappe-ID (valgfrit)
+              </label>
+              <input
+                type="text"
+                value={rootFolder}
+                onChange={(e) => setRootFolder(e.target.value)}
+                placeholder="fx 1QWf2LGX7ehmMMO0YdEwsmxfI9tUOR8VE"
+                className="w-full rounded-[var(--radius-md)] px-3 py-2 text-[13px]"
+                style={{
+                  background: "var(--bg-primary)",
+                  color: "var(--text-primary)",
+                  border: "1px solid var(--border-primary)",
+                  outline: "none",
+                }}
+              />
+              <p className="mt-1 text-[11px]" style={{ color: "var(--text-tertiary)" }}>
+                Begrænser søgningen til én mappe. ID&apos;et er den sidste del af mappens
+                URL i Drive. Lad feltet stå tomt for at gennemsøge hele drevet.
+              </p>
+            </div>
+
+            <Button
+              onClick={handleSaveRootFolder}
+              loading={rootFolderSaving}
+              variant="secondary"
+              size="sm"
+            >
+              Gem rodmappe
+            </Button>
+          </div>
+        ) : (
+          <div>
+            <p className="text-[12px] mb-4" style={{ color: "var(--text-secondary)" }}>
+              Når Drive er forbundet, kan systemet finde ordrebekræftelser i dine
+              mapper og bruge dem som datakilde ved import. Der gives kun læseadgang.
+            </p>
+            <Button onClick={handleConnectDrive} loading={driveConnecting} size="sm">
+              <ExternalLink className="h-3.5 w-3.5 mr-1.5" />
+              Forbind Google Drive
             </Button>
           </div>
         )}

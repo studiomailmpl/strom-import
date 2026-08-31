@@ -45,6 +45,7 @@ class BrandResponse(BaseModel):
     slug: str
     markup: float = 2.5
     image_bank_url: str | None = None
+    drive_folder_id: str | None = None
     image_bank_type: str | None = None
     image_bank_search_pattern: str | None = None
     image_bank_notes: str | None = None
@@ -61,6 +62,7 @@ class BrandCreate(BaseModel):
     slug: str | None = Field(None, max_length=255)
     markup: float = Field(2.5, ge=1.0, le=10.0, description="Markup multiplier (e.g. 2.5 = cost × 2.5)")
     image_bank_url: str | None = None
+    drive_folder_id: str | None = None
     image_bank_type: str | None = Field(None, pattern=r"^(datadwell|canto|trendmark|brandos|custom)$")
     image_bank_search_pattern: str | None = None
     image_bank_notes: str | None = None
@@ -72,6 +74,7 @@ class BrandUpdate(BaseModel):
     name: str | None = Field(None, min_length=1, max_length=255)
     markup: float | None = Field(None, ge=1.0, le=10.0)
     image_bank_url: str | None = None
+    drive_folder_id: str | None = None
     image_bank_type: str | None = None
     image_bank_search_pattern: str | None = None
     image_bank_notes: str | None = None
@@ -128,6 +131,7 @@ async def list_brands(
             slug=b.slug,
             markup=b.markup or 2.5,
             image_bank_url=b.image_bank_url,
+            drive_folder_id=b.drive_folder_id,
             image_bank_type=b.image_bank_type,
             image_bank_search_pattern=b.image_bank_search_pattern,
             image_bank_notes=b.image_bank_notes,
@@ -203,6 +207,7 @@ async def create_brand(
         slug=slug,
         markup=data.markup,
         image_bank_url=data.image_bank_url,
+        drive_folder_id=data.drive_folder_id,
         image_bank_type=data.image_bank_type,
         image_bank_search_pattern=data.image_bank_search_pattern,
         image_bank_notes=data.image_bank_notes,
@@ -221,6 +226,7 @@ async def create_brand(
         slug=brand.slug,
         markup=brand.markup or 2.5,
         image_bank_url=brand.image_bank_url,
+        drive_folder_id=brand.drive_folder_id,
         image_bank_type=brand.image_bank_type,
         image_bank_search_pattern=brand.image_bank_search_pattern,
         image_bank_notes=brand.image_bank_notes,
@@ -259,6 +265,8 @@ async def update_brand(
         brand.markup = data.markup
     if "image_bank_url" in provided:
         brand.image_bank_url = data.image_bank_url
+    if "drive_folder_id" in provided:
+        brand.drive_folder_id = data.drive_folder_id
     if "image_bank_type" in provided:
         brand.image_bank_type = data.image_bank_type
     if "image_bank_search_pattern" in provided:
@@ -283,6 +291,7 @@ async def update_brand(
         slug=brand.slug,
         markup=brand.markup or 2.5,
         image_bank_url=brand.image_bank_url,
+        drive_folder_id=brand.drive_folder_id,
         image_bank_type=brand.image_bank_type,
         image_bank_search_pattern=brand.image_bank_search_pattern,
         image_bank_notes=brand.image_bank_notes,

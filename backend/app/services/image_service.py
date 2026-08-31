@@ -14,6 +14,7 @@ import re
 import threading
 import time
 from io import BytesIO
+from pathlib import Path
 from urllib.parse import quote, urljoin, urlparse
 
 import anthropic
@@ -822,6 +823,115 @@ def _search_google_images(
     return []
 
 
+# ═══════════════════════════════════════════════
+# Brand Drive folder — authenticated image source
+# ═══════════════════════════════════════════════
+
+# Drive image files we can hand on to Shopify.
+_DRIVE_IMAGE_MIME_TYPES = ("image/jpeg", "image/png", "image/webp")
+
+
+def _drive_sku_variants(style_code: str) -> list[str]:
+    """
+    The forms a packshot filename might spell the SKU in.
+
+    Brands file images as "COHBU-M26388_1.jpg" but also as "COHBUM26388.jpg",
+    so search for the code with and without its separators.
+    """
+    code = (style_code or "").strip()
+    if not code:
+        return []
+    variants = [code]
+    stripped = re.sub(r"[\s\-_./]", "", code)
+    if stripped and stripped != code:
+        variants.append(stripped)
+    return variants
+
+
+def fetch_brand_drive_images(
+    folder_id: str,
+    access_token: str,
+    style_code: str,
+    vendor: str,
+    max_images: int = 5,
+) -> list[str]:
+    """
+    Fetch a product's packshots from the brand's Drive folder.
+
+    Drive files are not publicly readable, and Shopify fetches images by URL, so
+    the bytes are downloaded and written into the app's own image directory and
+    returned as public URLs — the same route that serves manually uploaded
+    images.
+
+    Synchronous on purpose: the whole image search runs in a worker thread, and
+    googleapiclient is synchronous anyway.
+
+    Returns an empty list when the folder holds nothing for this SKU.
+    """
+    from app.services.drive_service import build_drive_client
+
+    settings = get_settings()
+    variants = _drive_sku_variants(style_code)
+    if not variants or not folder_id or not access_token:
+        return []
+
+    def _escape(value: str) -> str:
+        return value.replace("\\", "\\\\").replace("'", "\\'")
+
+    name_clause = " or ".join(f"name contains '{_escape(v)}'" for v in variants)
+    mime_clause = " or ".join(f"mimeType = '{m}'" for m in _DRIVE_IMAGE_MIME_TYPES)
+    query = (
+        f"'{_escape(folder_id)}' in parents and trashed = false "
+        f"and ({mime_clause}) and ({name_clause})"
+    )
+
+    client = build_drive_client(access_token)
+    response = client.files().list(
+        q=query,
+        pageSize=max_images,
+        fields="files(id, name, mimeType)",
+        orderBy="name",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+
+    files = (response.get("files") or [])[:max_images]
+    if not files:
+        return []
+
+    # Mirror the layout the upload route uses, keyed by SKU so a re-run
+    # overwrites rather than accumulating copies.
+    safe_vendor = re.sub(r"[^A-Za-z0-9._-]", "_", vendor or "unknown")[:64]
+    safe_sku = re.sub(r"[^A-Za-z0-9._-]", "_", style_code)[:64]
+    relative_dir = Path("drive") / safe_vendor / safe_sku
+    target_dir = Path(settings.image_upload_dir) / relative_dir
+    target_dir.mkdir(parents=True, exist_ok=True, mode=0o750)
+
+    base_url = settings.public_base_url.rstrip("/")
+    urls: list[str] = []
+
+    for item in files:
+        try:
+            data = client.files().get_media(fileId=item["id"]).execute()
+        except Exception as e:
+            logger.warning(f"[IMG] Could not download Drive image {item.get('name')}: {e}")
+            continue
+        if not data:
+            continue
+
+        # Separators become underscores, so a name like "../../x.jpg" cannot
+        # walk out of the target directory. Leading dots go too, so a Drive file
+        # cannot land as a hidden file.
+        safe_name = (
+            re.sub(r"[^A-Za-z0-9._-]", "_", item.get("name", "image"))[:128].lstrip(".")
+            or "image"
+        )
+        (target_dir / safe_name).write_bytes(data)
+        urls.append(f"{base_url}/api/v1/images/{relative_dir.as_posix()}/{safe_name}")
+
+    return urls
+
+
 def find_product_images_and_details(
     vendor: str,
     style_code: str,
@@ -947,6 +1057,34 @@ def find_product_images_and_details(
     # Resolve brand domain from DB config or hardcoded config
     db_website_url = (brand_config or {}).get("website_url", "") or ""
     db_search_pattern = (brand_config or {}).get("search_url_pattern", "") or ""
+
+    # ── Strategy D: Brand's Google Drive folder ──
+    # An authenticated, curated source: the packshots the brand actually sent
+    # us. Tried before any SerpAPI strategy — it costs nothing, needs no
+    # scraping, and the files are already the right product.
+    drive_folder_id = (brand_config or {}).get("drive_folder_id", "") or ""
+    drive_access_token = (brand_config or {}).get("drive_access_token", "") or ""
+    if drive_folder_id and drive_access_token:
+        try:
+            drive_images = fetch_brand_drive_images(
+                folder_id=drive_folder_id,
+                access_token=drive_access_token,
+                style_code=style_code,
+                vendor=vendor,
+                max_images=max_images,
+            )
+            if drive_images:
+                result["images"] = drive_images
+                result["image_source"] = "brand_drive"
+                logger.info(
+                    f"[IMG] Brand Drive folder hit: {len(drive_images)} image(s) "
+                    f"for SKU '{style_code}'"
+                )
+                return result
+        except Exception as e:
+            # Never let Drive take down the whole image search — the scraping
+            # and SerpAPI strategies below are still worth trying.
+            logger.warning(f"[IMG] Brand Drive lookup failed for '{style_code}': {e}")
 
     # Extract domain from website_url for Google site-specific search
     brand_domain_for_google = ""

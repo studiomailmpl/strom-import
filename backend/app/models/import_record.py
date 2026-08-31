@@ -3,9 +3,9 @@ Import model — one per uploaded PDF invoice batch.
 """
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -36,6 +36,10 @@ class Import(Base):
     file_name: Mapped[str] = mapped_column(String(512), nullable=False)
     file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     file_size_bytes: Mapped[int | None] = mapped_column(Integer)
+
+    # Invoice header data, extracted from the PDF
+    invoice_number: Mapped[str | None] = mapped_column(String(100))
+    invoice_date: Mapped[date | None] = mapped_column(Date)
 
     # Pricing settings used for this import
     eur_rate: Mapped[float] = mapped_column(Float, default=7.46)

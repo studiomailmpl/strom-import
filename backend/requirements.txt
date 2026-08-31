@@ -16,6 +16,12 @@ httpx==0.28.1
 # PDF processing
 PyMuPDF==1.25.3
 
+# Spreadsheet order confirmations
+openpyxl==3.1.5
+
+# Fuzzy title matching between invoices and order confirmations
+rapidfuzz==3.11.0
+
 # AI
 anthropic==0.42.0
 
@@ -23,6 +29,10 @@ anthropic==0.42.0
 Pillow==11.1.0
 beautifulsoup4==4.12.3
 requests==2.32.3
+
+# Google Drive
+google-auth==2.38.0
+google-api-python-client==2.159.0
 
 # Security
 cryptography==44.0.0
@@ -37,3 +47,7 @@ pydantic-settings==2.7.1
 
 # File storage
 boto3==1.36.5
+
+# Tests
+pytest==8.3.4
+pytest-asyncio==0.25.2

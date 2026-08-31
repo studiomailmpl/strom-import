@@ -13,6 +13,8 @@ from app.models.product_image import ProductImage
 from app.models.oauth_nonce import OAuthNonce
 from app.models.keyword_performance import KeywordPerformance, SearchConsoleConfig
 from app.models.image_cache import ImageCache
+from app.models.drive_connection import DriveConnection
+from app.models.order_confirmation import OrderConfirmation, OrderConfirmationLine
 
 __all__ = [
     "Organisation",
@@ -27,4 +29,7 @@ __all__ = [
     "KeywordPerformance",
     "SearchConsoleConfig",
     "ImageCache",
+    "DriveConnection",
+    "OrderConfirmation",
+    "OrderConfirmationLine",
 ]

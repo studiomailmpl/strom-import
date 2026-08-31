@@ -1,9 +1,103 @@
 "use client";
 
-import { useState, useMemo, type ReactNode } from "react";
-import { Check, AlertTriangle, XCircle, Package } from "lucide-react";
+import { useState, useMemo, Fragment, type ReactNode } from "react";
+import {
+  Check,
+  AlertTriangle,
+  XCircle,
+  Package,
+  FileCheck2,
+  Link2,
+  ChevronDown,
+  ChevronRight,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { ProductCard } from "./product-card";
 import type { ImportProduct, ProductVariant } from "./product-card";
+
+/* ─── Order confirmation match ─── */
+
+/**
+ * A match this strong is treated as verified; below it the confirmation was
+ * matched on a weaker signal (a fuzzy title, a colour code) and is worth a
+ * human glance before the data is trusted.
+ */
+const CONFIDENT_MATCH = 90;
+
+type MatchState = "matched" | "uncertain" | "unmatched";
+
+function matchState(product: ImportProduct): MatchState {
+  if (!product.order_confirmation_line_id) return "unmatched";
+  return (product.match_confidence ?? 0) >= CONFIDENT_MATCH ? "matched" : "uncertain";
+}
+
+/** Human labels for the merge policy's source values. */
+const SOURCE_LABELS: Record<string, string> = {
+  order_confirmation: "Ordrebekræftelse",
+  invoice: "Faktura",
+  web: "Web",
+  manual: "Manuelt",
+};
+
+const FIELD_LABELS: Record<string, string> = {
+  style_code: "Varenummer",
+  title: "Titel",
+  color_code: "Farvekode",
+  color_original: "Farve (original)",
+  size_range: "Størrelser",
+  quantity: "Antal",
+  cost_price_eur: "Kostpris",
+  rrp: "Vejl. udsalgspris",
+  images: "Billeder",
+  description_da: "Beskrivelse",
+};
+
+/** Tooltip listing which source won each field. */
+function DataSourceTooltip({ sources }: { sources: Record<string, string> }) {
+  const [show, setShow] = useState(false);
+  const entries = Object.entries(sources);
+  if (entries.length === 0) return null;
+
+  return (
+    <span
+      className="relative inline-flex"
+      onMouseEnter={() => setShow(true)}
+      onMouseLeave={() => setShow(false)}
+    >
+      <FileCheck2
+        className="h-3.5 w-3.5 cursor-help"
+        style={{ color: "var(--text-tertiary)" }}
+      />
+      {show && (
+        <span
+          className="absolute right-0 top-full mt-1.5 z-50 w-56 rounded-[var(--radius-md)] px-3 py-2"
+          style={{
+            background: "var(--bg-primary)",
+            border: "1px solid var(--border-primary)",
+            boxShadow: "var(--shadow-md)",
+          }}
+        >
+          <span
+            className="mb-1 block text-[10px] font-medium uppercase tracking-[0.05em]"
+            style={{ color: "var(--text-tertiary)" }}
+          >
+            Datakilde pr. felt
+          </span>
+          {entries.map(([field, source]) => (
+            <span key={field} className="flex justify-between gap-2 text-[11px]">
+              <span style={{ color: "var(--text-secondary)" }}>
+                {FIELD_LABELS[field] || field}
+              </span>
+              <span style={{ color: "var(--text-primary)" }}>
+                {SOURCE_LABELS[source] || source}
+              </span>
+            </span>
+          ))}
+        </span>
+      )}
+    </span>
+  );
+}
 
 /* ─── Tooltip ─── */
 
@@ -39,6 +133,29 @@ function StatusTooltip({ warnings, children }: { warnings: string[]; children: R
   );
 }
 
+/* ─── SKU ─── */
+
+/**
+ * The SKU the Shopify push will actually write.
+ *
+ * Source of truth: backend/app/services/shopify_service.py
+ *   sku = f"{style_code}-{var_size}" if style_code else var_size
+ *
+ * Keep this in step with that line — showing anything else here means the
+ * reviewer approves one SKU and Shopify receives another.
+ */
+function buildVariantSku(styleCode: string, size: string): string {
+  const code = (styleCode || "").trim();
+  const variantSize = (size || "").trim();
+  return code ? `${code}-${variantSize}` : variantSize;
+}
+
+/**
+ * A product with no variants is not pushed as-is: shopify_service falls back to
+ * a single "One Size" variant, so that is the size its SKU ends up carrying.
+ */
+const PUSH_FALLBACK_SIZE = "One Size";
+
 /* ─── Types ─── */
 
 interface FlatVariant {
@@ -48,6 +165,7 @@ interface FlatVariant {
   styleCode: string;
   color: string;
   size: string;
+  sku: string;
   quantity: number;
   costPriceEur: number | null;
   retailPriceDkk: number | null;
@@ -134,6 +252,15 @@ interface ReviewTableProps {
   onToggleSelect: (productId: string) => void;
   onToggleAll: () => void;
   readOnly?: boolean;
+  /** Persist an edit to a product. When omitted the table stays read-only —
+   *  rows are not expandable and no editor is mounted. */
+  onUpdateProduct?: (productId: string, data: Partial<ImportProduct>) => void | Promise<void>;
+  /** Let the user point an unmatched product at an order confirmation in Drive.
+   *  Omit to hide the match column entirely. */
+  onLinkOrderConfirmation?: (productId: string) => void;
+  /** Show the match column even without a link handler — the history view has
+   *  nothing to link, but still wants to show what was matched. */
+  showMatchColumn?: boolean;
 }
 
 /* ─── Component ─── */
@@ -144,7 +271,19 @@ export function ReviewTable({
   onToggleSelect,
   onToggleAll,
   readOnly = false,
+  onUpdateProduct,
+  onLinkOrderConfirmation,
+  showMatchColumn,
 }: ReviewTableProps) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const canEdit = !readOnly && Boolean(onUpdateProduct);
+
+  // Show the column when asked to, when a link handler exists, or whenever any
+  // product actually carries match data — otherwise it is dead space.
+  const withMatchColumn =
+    showMatchColumn ??
+    (Boolean(onLinkOrderConfirmation) ||
+      products.some((p) => p.order_confirmation_line_id || p.data_sources));
   const flatVariants = useMemo(() => {
     const rows: FlatVariant[] = [];
     for (const product of products) {
@@ -157,6 +296,7 @@ export function ReviewTable({
           styleCode: product.style_code,
           color: product.color,
           size: "-",
+          sku: buildVariantSku(product.style_code, PUSH_FALLBACK_SIZE),
           quantity: 0,
           costPriceEur: product.cost_price_eur,
           retailPriceDkk: product.retail_price_dkk,
@@ -174,6 +314,7 @@ export function ReviewTable({
             styleCode: product.style_code,
             color: product.color,
             size: variant.size,
+            sku: buildVariantSku(product.style_code, variant.size),
             quantity: variant.quantity,
             costPriceEur: product.cost_price_eur,
             retailPriceDkk: product.retail_price_dkk,
@@ -220,6 +361,59 @@ export function ReviewTable({
     }
   };
 
+  const matchBadge = (product: ImportProduct) => {
+    const state = matchState(product);
+    const confidence = product.match_confidence ?? 0;
+    const sources = product.data_sources || {};
+
+    if (state === "unmatched") {
+      return (
+        <div className="flex items-center gap-1.5">
+          <Badge variant="error" className="gap-1">
+            <XCircle className="h-3 w-3" />
+            Ingen match
+          </Badge>
+          {!readOnly && onLinkOrderConfirmation && (
+            <button
+              onClick={(e) => {
+                // The row itself toggles the editor when editing is enabled,
+                // so without this the Link button would expand the row instead.
+                e.stopPropagation();
+                onLinkOrderConfirmation(product.id);
+              }}
+              title="Peg på den rigtige ordrebekræftelse i Drive"
+              className="inline-flex items-center gap-1 rounded-[var(--radius-sm)] px-1.5 py-1 text-[11px] transition-colors"
+              style={{
+                color: "var(--text-secondary)",
+                border: "1px solid var(--border-primary)",
+              }}
+            >
+              <Link2 className="h-3 w-3" />
+              Link
+            </button>
+          )}
+        </div>
+      );
+    }
+
+    return (
+      <div className="flex items-center gap-1.5">
+        {state === "matched" ? (
+          <Badge variant="success" className="gap-1">
+            <Check className="h-3 w-3" />
+            Matchet {confidence}%
+          </Badge>
+        ) : (
+          <Badge variant="warning" className="gap-1">
+            <AlertTriangle className="h-3 w-3" />
+            Usikkert {confidence}%
+          </Badge>
+        )}
+        <DataSourceTooltip sources={sources} />
+      </div>
+    );
+  };
+
   if (products.length === 0) {
     return (
       <div
@@ -238,6 +432,16 @@ export function ReviewTable({
   }
 
   let lastProductId = "";
+  // Width of the expanded editor row. Counts the seven data columns, the
+  // checkbox when the table is editable, and the match column when shown —
+  // get this wrong and the editor row is narrower or wider than the table.
+  const colCount = 7 + (readOnly ? 0 : 1) + (withMatchColumn ? 1 : 0);
+
+  const rowBackground = (isSelected: boolean, isExpanded: boolean) => {
+    if (isExpanded) return "var(--bg-secondary)";
+    if (isSelected && !readOnly) return "var(--accent-light)";
+    return "transparent";
+  };
 
   return (
     <div className="card overflow-x-auto rounded-[var(--radius-lg)]">
@@ -300,6 +504,14 @@ export function ReviewTable({
             >
               Status
             </th>
+            {withMatchColumn && (
+              <th
+                className="px-4 py-3 text-left text-[11px] font-medium uppercase tracking-[0.05em]"
+                style={{ color: "var(--text-tertiary)" }}
+              >
+                Ordrebekræftelse
+              </th>
+            )}
           </tr>
         </thead>
         <tbody>
@@ -307,34 +519,34 @@ export function ReviewTable({
             const showTitle = row.productId !== lastProductId;
             lastProductId = row.productId;
             const isSelected = selectedIds.has(row.productId);
+            const isExpanded = expandedId === row.productId;
+            // A product spans one row per variant — hang the editor off the last of them.
+            const isLastRowOfProduct =
+              idx === flatVariants.length - 1 ||
+              flatVariants[idx + 1].productId !== row.productId;
 
-            const skuParts = [
-              row.vendor?.substring(0, 3).toUpperCase() || "---",
-              row.styleCode || "0000",
-              row.color?.substring(0, 3).toUpperCase() || "---",
-              row.size,
-            ];
-            const sku = skuParts.join("-");
+            const sku = row.sku;
 
             return (
+              <Fragment key={`${row.productId}-${row.size}-${idx}`}>
               <tr
-                key={`${row.productId}-${row.size}-${idx}`}
                 className="transition-colors"
                 style={{
                   borderBottom: "1px solid var(--border-secondary)",
-                  background: isSelected && !readOnly ? "var(--accent-light)" : "transparent",
+                  background: rowBackground(isSelected, isExpanded),
+                  cursor: canEdit ? "pointer" : undefined,
                   ...(showTitle && idx > 0
                     ? { borderTop: "1px solid var(--border-primary)" }
                     : {}),
                 }}
+                onClick={canEdit ? () => setExpandedId(isExpanded ? null : row.productId) : undefined}
                 onMouseEnter={(e) => {
-                  if (!isSelected || readOnly) {
+                  if (!isExpanded && (!isSelected || readOnly)) {
                     e.currentTarget.style.background = "var(--bg-secondary)";
                   }
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.background =
-                    isSelected && !readOnly ? "var(--accent-light)" : "transparent";
+                  e.currentTarget.style.background = rowBackground(isSelected, isExpanded);
                 }}
               >
                 {!readOnly && (
@@ -344,6 +556,7 @@ export function ReviewTable({
                         type="checkbox"
                         checked={isSelected}
                         onChange={() => onToggleSelect(row.productId)}
+                        onClick={(e) => e.stopPropagation()}
                         className="h-4 w-4 rounded"
                         style={{ accentColor: "var(--accent)" }}
                       />
@@ -351,26 +564,41 @@ export function ReviewTable({
                   </td>
                 )}
                 <td className="px-4 py-3">
-                  {showTitle ? (
-                    <div>
-                      <p className="font-medium" style={{ color: "var(--text-primary)" }}>
-                        {row.productTitle}
-                      </p>
+                  <div className="flex items-start gap-1.5">
+                    {canEdit && (
+                      <span className="mt-0.5 flex-shrink-0" style={{ color: "var(--text-tertiary)" }}>
+                        {showTitle ? (
+                          isExpanded ? (
+                            <ChevronDown className="h-3.5 w-3.5" />
+                          ) : (
+                            <ChevronRight className="h-3.5 w-3.5" />
+                          )
+                        ) : (
+                          <span className="inline-block h-3.5 w-3.5" />
+                        )}
+                      </span>
+                    )}
+                    {showTitle ? (
+                      <div>
+                        <p className="font-medium" style={{ color: "var(--text-primary)" }}>
+                          {row.productTitle}
+                        </p>
+                        <p
+                          className="mt-0.5 font-mono text-[11px]"
+                          style={{ color: "var(--text-tertiary)" }}
+                        >
+                          {sku}
+                        </p>
+                      </div>
+                    ) : (
                       <p
-                        className="mt-0.5 font-mono text-[11px]"
+                        className="font-mono text-[11px]"
                         style={{ color: "var(--text-tertiary)" }}
                       >
                         {sku}
                       </p>
-                    </div>
-                  ) : (
-                    <p
-                      className="font-mono text-[11px]"
-                      style={{ color: "var(--text-tertiary)" }}
-                    >
-                      {sku}
-                    </p>
-                  )}
+                    )}
+                  </div>
                 </td>
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-2">
@@ -406,7 +634,31 @@ export function ReviewTable({
                     : "\u2014"}
                 </td>
                 <td className="px-4 py-3">{statusBadge(row.status, row.warnings)}</td>
+                {withMatchColumn && (
+                  <td className="px-4 py-3">
+                    {/* One badge per product, not per variant row. */}
+                    {showTitle && matchBadge(row.product)}
+                  </td>
+                )}
               </tr>
+              {canEdit && isExpanded && isLastRowOfProduct && (
+                <tr style={{ borderBottom: "1px solid var(--border-primary)" }}>
+                  <td
+                    colSpan={colCount}
+                    className="p-4"
+                    style={{ background: "var(--bg-secondary)" }}
+                  >
+                    <ProductCard
+                      product={row.product}
+                      defaultExpanded
+                      onUpdate={(id, data) => onUpdateProduct?.(id, data)}
+                      onApprove={(id) => onUpdateProduct?.(id, { status: "approved" })}
+                      onSkip={(id) => onUpdateProduct?.(id, { status: "skipped" })}
+                    />
+                  </td>
+                </tr>
+              )}
+              </Fragment>
             );
           })}
         </tbody>
