@@ -99,6 +99,10 @@ async def _run_index(org_id: uuid.UUID, vendor_names: list[str], max_files: int)
             candidates = await list_order_confirmation_candidates(
                 db, org_id, vendor_names=vendor_names, max_files=max_files
             )
+            # Listing may have refreshed the access token, which only flushes.
+            # Commit it now: if every file turns out to be cached below there is
+            # no later commit, and the refreshed token would be discarded.
+            await db.commit()
             logger.info(
                 "Drive index org=%s: %d candidate(s)", str(org_id)[:8], len(candidates)
             )

@@ -614,3 +614,78 @@ class TestListOrderConfirmationCandidates:
         assert candidate.mime_type == ds.MIME_PDF
         assert candidate.modified_time == "2026-06-01T00:00:00.000Z"
         assert candidate.matched_by == "index"
+
+
+# ═══════════════════════════════════════════════
+# Token refresh must not commit the caller's transaction
+# ═══════════════════════════════════════════════
+
+class _RecordingSession:
+    """Minimal session stand-in that records commit/flush calls."""
+
+    def __init__(self, connection):
+        self._connection = connection
+        self.commits = 0
+        self.flushes = 0
+
+    async def execute(self, *a, **kw):
+        connection = self._connection
+
+        class _Result:
+            def scalar_one_or_none(self):
+                return connection
+
+        return _Result()
+
+    async def commit(self):
+        self.commits += 1
+
+    async def flush(self):
+        self.flushes += 1
+
+
+class _StoredConnection:
+    def __init__(self, encrypted_access_token, encrypted_refresh_token, expires_at):
+        self.encrypted_access_token = encrypted_access_token
+        self.encrypted_refresh_token = encrypted_refresh_token
+        self.token_expires_at = expires_at
+        self.root_folder_id = None
+
+
+class TestTokenRefreshTransaction:
+    async def test_a_refresh_flushes_but_does_not_commit(self, monkeypatch):
+        """
+        The import pipeline calls this mid-analysis. Committing here would
+        commit whatever else that transaction has in flight.
+        """
+        from datetime import datetime, timedelta, timezone
+        from app.core.security import encrypt_token
+
+        expired = datetime.now(timezone.utc) - timedelta(minutes=5)
+        connection = _StoredConnection(
+            encrypt_token("old-token"), encrypt_token("refresh-token"), expired
+        )
+        session = _RecordingSession(connection)
+
+        monkeypatch.setattr(
+            ds, "_refresh_sync",
+            lambda rt: ("new-token", datetime.now(timezone.utc) + timedelta(hours=1)),
+        )
+
+        token = await ds.get_valid_access_token(session, uuid.uuid4())
+
+        assert token == "new-token"
+        assert session.flushes == 1
+        assert session.commits == 0, "the caller owns the transaction"
+
+    async def test_a_still_valid_token_writes_nothing(self, monkeypatch):
+        from datetime import datetime, timedelta, timezone
+        from app.core.security import encrypt_token
+
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+        connection = _StoredConnection(encrypt_token("live-token"), "", future)
+        session = _RecordingSession(connection)
+
+        assert await ds.get_valid_access_token(session, uuid.uuid4()) == "live-token"
+        assert session.flushes == 0
+        assert session.commits == 0

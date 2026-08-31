@@ -124,7 +124,14 @@ async def get_valid_access_token(
     refresh was rejected — callers should treat that as "not connected".
 
     Takes the session as its first argument, matching the other services in
-    this package; a token refresh writes back to the same transaction.
+    this package. A refresh writes the new token back through that session but
+    only flushes it — committing here would commit whatever else the caller has
+    in flight. The import pipeline calls this mid-analysis, so a commit would
+    quietly break the "one import, one transaction" property.
+
+    The cost of not committing is that a caller who rolls back loses the
+    refreshed token and the next call refreshes again. Refresh tokens are
+    reusable, so that is wasteful at worst, never wrong.
     """
     connection = await get_drive_connection(db, org_id)
     if not connection or not connection.encrypted_access_token:
@@ -161,7 +168,8 @@ async def get_valid_access_token(
         )
     else:
         connection.token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=3600)
-    await db.commit()
+    # Flush, not commit — the caller owns the transaction.
+    await db.flush()
 
     logger.info("Refreshed Drive access token for org %s", org_id)
     return new_token
