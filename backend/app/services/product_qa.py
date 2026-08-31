@@ -15,6 +15,10 @@ Each warning has:
 import logging
 import re
 
+# One definition of "too far apart", shared with the merge policy that applies
+# the same rule when an order confirmation is linked outside the pipeline.
+from app.services.order_matching import COST_TOLERANCE
+
 logger = logging.getLogger(__name__)
 
 
@@ -330,6 +334,46 @@ def _check_pricing(p: dict, eur_rate: float = 7.46) -> list[dict]:
 # Color checks
 # ══════════════��════════════════════════════════
 
+def _check_cost_vs_order_confirmation(p: dict) -> list[dict]:
+    """
+    Compare what the invoice charged against what the order confirmation quoted.
+
+    A gap here means a price error, a currency mix-up (a DKK figure read as EUR
+    lands about 7x out) or a supplier changing the price after the order — all
+    worth catching before the product reaches Shopify with the wrong margin.
+
+    Reads the two figures the merge stashed on the product. cost_price_eur
+    itself is no use: the merge policy overwrites it with the confirmation's
+    price, so comparing it against the confirmation would always give zero.
+    """
+    invoice_cost = p.get("_invoice_cost_price_eur")
+    order_cost = p.get("_order_confirmation_wholesale_price")
+
+    if invoice_cost is None or order_cost is None:
+        return []
+    try:
+        invoice_cost = float(invoice_cost)
+        order_cost = float(order_cost)
+    except (TypeError, ValueError):
+        return []
+
+    denominator = max(abs(invoice_cost), abs(order_cost))
+    if denominator == 0:
+        return []
+
+    deviation = abs(invoice_cost - order_cost) / denominator
+    if deviation <= COST_TOLERANCE:
+        return []
+
+    return [_warn(
+        "warning",
+        "cost_mismatch_order_confirmation",
+        "cost_price_eur",
+        f"Prisafvigelse: faktura €{invoice_cost:.2f}, "
+        f"ordrebekræftelse €{order_cost:.2f} ({deviation * 100:.1f}%)",
+    )]
+
+
 def _check_color(p: dict) -> list[dict]:
     warnings = []
     color = (p.get("color") or "").strip()
@@ -444,6 +488,7 @@ def validate_product(product: dict, eur_rate: float = 7.46) -> list[dict]:
     warnings.extend(_check_images(product))
     warnings.extend(_check_variants(product))
     warnings.extend(_check_pricing(product, eur_rate=eur_rate))
+    warnings.extend(_check_cost_vs_order_confirmation(product))
     warnings.extend(_check_color(product))
     warnings.extend(_check_handle(product))
     warnings.extend(_check_misc(product))
@@ -462,6 +507,18 @@ def validate_products(products: list[dict], eur_rate: float = 7.46) -> list[dict
     """
     for p in products:
         warnings = validate_product(p, eur_rate=eur_rate)
+
+        # Carry over warnings raised earlier in the pipeline — the order
+        # confirmation merge adds its own. Assigning outright would silently
+        # drop them, since QA runs after the merge. Deduplicated on
+        # (code, field) so a check that also runs here is not listed twice.
+        seen = {(w.get("code"), w.get("field")) for w in warnings}
+        for existing in p.get("qa_warnings") or []:
+            key = (existing.get("code"), existing.get("field"))
+            if key not in seen:
+                seen.add(key)
+                warnings.append(existing)
+
         p["qa_warnings"] = warnings
 
         # Log summary per product (only if issues found)

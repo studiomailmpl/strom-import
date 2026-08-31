@@ -434,6 +434,16 @@ def merge_with_order_data(
     invoice_cost = getattr(product, "cost_price_eur", None)
     order_cost = primary.wholesale_price
 
+    # Keep both figures. The merge below overwrites cost_price_eur with the
+    # confirmation's price, so without this the two are identical by the time
+    # the QA pass runs and the comparison would always come out at zero.
+    # Underscore-prefixed, following the pipeline's convention for values that
+    # travel with a product dict but are not columns.
+    if invoice_cost is not None:
+        product._invoice_cost_price_eur = invoice_cost
+    if order_cost is not None:
+        product._order_confirmation_wholesale_price = order_cost
+
     deviation = _cost_deviates(invoice_cost, order_cost)
     if deviation is not None and deviation > COST_TOLERANCE:
         outcome.warnings.append({
