@@ -61,6 +61,32 @@ QUERY_PAGE_SIZE = 20
 
 FILE_FIELDS = "files(id, name, mimeType, modifiedTime, webViewLink, size)"
 
+# Indexing walks pages rather than taking the top few, so it asks for more per
+# call and needs the page token back.
+INDEX_PAGE_SIZE = 100
+INDEX_FILE_FIELDS = f"nextPageToken, {FILE_FIELDS}"
+
+# Words that mark a file as an order confirmation, across the languages our
+# suppliers write in. Matched against the filename only — Drive's "name
+# contains" is cheap, whereas fullText search would drag in every invoice.
+ORDER_CONFIRMATION_NAME_HINTS = (
+    "order confirmation",
+    "orderconfirmation",
+    "order-confirmation",
+    "order_confirmation",
+    "ordrebekræftelse",
+    "ordrebekraeftelse",
+    "orderbekräftelse",
+    "auftragsbestätigung",
+    "auftragsbestaetigung",
+    "confirmation de commande",
+    "conferma d'ordine",
+    "sales order",
+    "purchase order",
+    "orderconf",
+    "order conf",
+)
+
 
 async def get_drive_connection(
     db: AsyncSession, org_id: uuid.UUID
@@ -482,6 +508,152 @@ def _download_sync(client, file_id: str) -> bytes:
         return client.files().export_media(fileId=file_id, mimeType=MIME_PDF).execute()
 
     return client.files().get_media(fileId=file_id).execute()
+
+
+# ═══════════════════════════════════════════════
+# Indexing — find every order confirmation up front
+# ═══════════════════════════════════════════════
+
+def looks_like_order_confirmation(name: str, vendor_names: list[str] | None = None) -> bool:
+    """
+    Whether a filename looks like an order confirmation.
+
+    True for a confirmation keyword in any of our suppliers' languages, or for a
+    known vendor name — brands often name the file after themselves and the
+    season alone. Used to filter what Drive returns, so a broad query cannot
+    drag unrelated files into the parse queue.
+    """
+    if not name:
+        return False
+    lowered = name.casefold()
+
+    if any(hint in lowered for hint in ORDER_CONFIRMATION_NAME_HINTS):
+        return True
+
+    for vendor in vendor_names or []:
+        vendor = (vendor or "").strip().casefold()
+        if len(vendor) >= 3 and vendor in lowered:
+            return True
+
+    return False
+
+
+def build_index_queries(
+    vendor_names: list[str] | None = None,
+    root_folder_id: str | None = None,
+    *,
+    terms_per_query: int = 20,
+    max_vendors: int = 40,
+) -> list[str]:
+    """
+    Build the Drive queries that sweep for order confirmations.
+
+    Terms are batched rather than sent one per call: Drive accepts a long OR
+    chain, and one request per brand would be dozens of round trips.
+    """
+    terms: list[str] = list(ORDER_CONFIRMATION_NAME_HINTS)
+    for vendor in (vendor_names or [])[:max_vendors]:
+        vendor = (vendor or "").strip()
+        if len(vendor) >= 3:
+            terms.append(vendor)
+
+    queries: list[str] = []
+    for start in range(0, len(terms), terms_per_query):
+        batch = terms[start:start + terms_per_query]
+        clause = " or ".join(
+            f"name contains '{_escape_query_value(term)}'" for term in batch
+        )
+        queries.append(_wrap_query(clause, root_folder_id))
+    return queries
+
+
+def _run_index_queries(client, queries: list[str], max_files: int) -> list[dict]:
+    """
+    Execute the sweep, following pagination. Blocking — call via to_thread.
+
+    Returns raw Drive file dicts, deduplicated by id.
+    """
+    seen: dict[str, dict] = {}
+
+    for query in queries:
+        page_token = None
+        while True:
+            if len(seen) >= max_files:
+                return list(seen.values())
+            try:
+                response = client.files().list(
+                    q=query,
+                    pageSize=INDEX_PAGE_SIZE,
+                    fields=INDEX_FILE_FIELDS,
+                    orderBy="modifiedTime desc",
+                    pageToken=page_token,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                ).execute()
+            except Exception as e:
+                logger.warning("Drive index query failed: %s", e)
+                break
+
+            for item in response.get("files", []) or []:
+                file_id = item.get("id")
+                if file_id and file_id not in seen:
+                    seen[file_id] = item
+
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+    return list(seen.values())
+
+
+async def list_order_confirmation_candidates(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    vendor_names: list[str] | None = None,
+    max_files: int = 200,
+) -> list[DriveCandidate]:
+    """
+    Sweep Drive for everything that looks like an order confirmation.
+
+    Restricted to the organisation's root folder when one is set. Filenames are
+    re-checked locally after the query, because Drive's "name contains" is a
+    loose token match and will return more than the terms strictly imply.
+
+    Returns an empty list when the organisation has no usable Drive connection.
+    """
+    access_token = await get_valid_access_token(db, org_id)
+    if not access_token:
+        logger.info("Drive index skipped for org %s — not connected", org_id)
+        return []
+
+    connection = await get_drive_connection(db, org_id)
+    root_folder_id = connection.root_folder_id if connection else None
+
+    queries = build_index_queries(vendor_names, root_folder_id)
+    client = build_drive_client(access_token)
+    raw_files = await asyncio.to_thread(
+        _run_index_queries, client, queries, max_files
+    )
+
+    candidates = [
+        DriveCandidate(
+            file_id=item["id"],
+            name=item.get("name", ""),
+            mime_type=item.get("mimeType", ""),
+            modified_time=item.get("modifiedTime"),
+            score=SCORE_VENDOR,
+            matched_by="index",
+            web_view_link=item.get("webViewLink"),
+        )
+        for item in raw_files
+        if looks_like_order_confirmation(item.get("name", ""), vendor_names)
+    ]
+
+    logger.info(
+        "Drive index for org=%s: %d file(s) returned, %d look like confirmations",
+        org_id, len(raw_files), len(candidates),
+    )
+    return candidates
 
 
 def _get_file_metadata_sync(client, file_id: str) -> dict:

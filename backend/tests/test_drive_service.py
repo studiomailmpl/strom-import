@@ -466,3 +466,151 @@ def _patch_connected(monkeypatch, files: FakeFiles, connection=None):
     monkeypatch.setattr(ds, "get_valid_access_token", _async_return("token"))
     monkeypatch.setattr(ds, "get_drive_connection", _async_return(connection))
     monkeypatch.setattr(ds, "build_drive_client", lambda token: FakeDriveClient(files))
+
+
+# ═══════════════════════════════════════════════
+# Indexing
+# ═══════════════════════════════════════════════
+
+class TestLooksLikeOrderConfirmation:
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Order Confirmation 25VA051691.pdf",
+            "order_confirmation_AW26.xlsx",
+            "Ordrebekræftelse AW26.pdf",
+            "Auftragsbestätigung 123.pdf",
+            "confirmation de commande.pdf",
+            "SALES ORDER 998.csv",
+        ],
+    )
+    def test_confirmation_keywords_in_several_languages(self, name):
+        assert ds.looks_like_order_confirmation(name)
+
+    def test_a_known_vendor_name_counts(self):
+        """Brands often name the file after themselves and the season."""
+        assert ds.looks_like_order_confirmation(
+            "Carhartt WIP AW26.xlsx", vendor_names=["Carhartt WIP"]
+        )
+
+    def test_vendor_matching_is_case_insensitive(self):
+        assert ds.looks_like_order_confirmation("marni ss27.pdf", vendor_names=["Marni"])
+
+    def test_very_short_vendor_names_are_ignored(self):
+        """A two-letter brand would match almost every filename."""
+        assert not ds.looks_like_order_confirmation("AB Invoice.pdf", vendor_names=["AB"])
+
+    @pytest.mark.parametrize(
+        "name", ["Faktura 12345.pdf", "Price list SS27.xlsx", "Lookbook.pdf", ""],
+    )
+    def test_unrelated_files_are_rejected(self, name):
+        assert not ds.looks_like_order_confirmation(name, vendor_names=["Marni"])
+
+
+class TestBuildIndexQueries:
+    def test_covers_every_keyword_across_batches(self):
+        queries = ds.build_index_queries()
+        combined = " ".join(queries)
+        for hint in ds.ORDER_CONFIRMATION_NAME_HINTS:
+            # Hints go through the same escaping as any other value —
+            # "conferma d'ordine" would otherwise break the query.
+            assert f"name contains '{ds._escape_query_value(hint)}'" in combined
+
+    def test_terms_are_batched_rather_than_one_query_each(self):
+        queries = ds.build_index_queries(terms_per_query=5)
+        assert len(queries) < len(ds.ORDER_CONFIRMATION_NAME_HINTS)
+        assert len(queries) >= 2
+
+    def test_vendor_names_are_included(self):
+        combined = " ".join(ds.build_index_queries(vendor_names=["Carhartt WIP"]))
+        assert "name contains 'Carhartt WIP'" in combined
+
+    def test_short_vendor_names_are_dropped(self):
+        combined = " ".join(ds.build_index_queries(vendor_names=["AB", "Marni"]))
+        assert "name contains 'AB'" not in combined
+        assert "name contains 'Marni'" in combined
+
+    def test_vendor_count_is_capped(self):
+        vendors = [f"Brand{i:03d}" for i in range(200)]
+        combined = " ".join(ds.build_index_queries(vendor_names=vendors, max_vendors=10))
+        assert "name contains 'Brand009'" in combined
+        assert "name contains 'Brand010'" not in combined
+
+    def test_root_folder_and_shared_constraints_apply_to_every_query(self):
+        queries = ds.build_index_queries(root_folder_id="ROOT42")
+        for query in queries:
+            assert "'ROOT42' in parents" in query
+            assert "trashed = false" in query
+            assert f"mimeType = '{ds.MIME_PDF}'" in query
+
+    def test_apostrophes_in_a_vendor_name_are_escaped(self):
+        combined = " ".join(ds.build_index_queries(vendor_names=["Levi's"]))
+        assert "Levi\\'s" in combined
+
+
+class TestRunIndexQueries:
+    def test_follows_pagination(self):
+        files = FakeFiles(list_results=[
+            {"files": [drive_file("f1")], "nextPageToken": "p2"},
+            {"files": [drive_file("f2")]},
+        ])
+        result = ds._run_index_queries(FakeDriveClient(files), ["q"], max_files=100)
+        assert {f["id"] for f in result} == {"f1", "f2"}
+        assert files.list_calls[1]["pageToken"] == "p2"
+
+    def test_deduplicates_files_seen_by_more_than_one_query(self):
+        files = FakeFiles(list_results=[
+            {"files": [drive_file("f1")]},
+            {"files": [drive_file("f1"), drive_file("f2")]},
+        ])
+        result = ds._run_index_queries(FakeDriveClient(files), ["q1", "q2"], max_files=100)
+        assert len(result) == 2
+
+    def test_stops_at_max_files(self):
+        files = FakeFiles(list_results=[
+            {"files": [drive_file(f"f{i}") for i in range(10)], "nextPageToken": "p2"},
+        ])
+        result = ds._run_index_queries(FakeDriveClient(files), ["q"], max_files=3)
+        assert len(result) >= 3
+        assert len(files.list_calls) == 1, "must not keep paging past the cap"
+
+    def test_a_failing_query_does_not_abort_the_sweep(self):
+        files = FakeFiles(list_results=[RuntimeError("Drive 500"), {"files": [drive_file("f2")]}])
+        result = ds._run_index_queries(FakeDriveClient(files), ["q1", "q2"], max_files=100)
+        assert [f["id"] for f in result] == ["f2"]
+
+
+class TestListOrderConfirmationCandidates:
+    async def test_returns_empty_when_not_connected(self, monkeypatch, org_id):
+        monkeypatch.setattr(ds, "get_valid_access_token", _async_return(None))
+        assert await ds.list_order_confirmation_candidates(None, org_id) == []
+
+    async def test_filters_out_files_that_only_matched_loosely(self, monkeypatch, org_id):
+        """Drive's name search is a loose token match, so re-check locally."""
+        files = FakeFiles(list_results=[{"files": [
+            drive_file("keep", "Order Confirmation AW26.pdf"),
+            drive_file("drop", "Random Lookbook.pdf"),
+        ]}])
+        _patch_connected(monkeypatch, files, connection=_FakeConnection())
+
+        result = await ds.list_order_confirmation_candidates(None, org_id)
+        assert [c.file_id for c in result] == ["keep"]
+
+    async def test_uses_the_configured_root_folder(self, monkeypatch, org_id):
+        files = FakeFiles(list_results=[{"files": []}])
+        _patch_connected(monkeypatch, files, connection=_FakeConnection("ROOT42"))
+
+        await ds.list_order_confirmation_candidates(None, org_id)
+        assert "'ROOT42' in parents" in files.list_calls[0]["q"]
+
+    async def test_candidates_carry_what_the_parser_needs(self, monkeypatch, org_id):
+        files = FakeFiles(list_results=[{"files": [
+            drive_file("f1", "Order Confirmation.pdf", modified="2026-06-01T00:00:00.000Z")
+        ]}])
+        _patch_connected(monkeypatch, files, connection=_FakeConnection())
+
+        candidate = (await ds.list_order_confirmation_candidates(None, org_id))[0]
+        assert candidate.name == "Order Confirmation.pdf"
+        assert candidate.mime_type == ds.MIME_PDF
+        assert candidate.modified_time == "2026-06-01T00:00:00.000Z"
+        assert candidate.matched_by == "index"

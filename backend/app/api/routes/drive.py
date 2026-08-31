@@ -7,6 +7,9 @@ Endpoints:
   GET  /drive/status           — Whether Drive is connected + optional root folder
   POST /drive/disconnect       — Delete the connection
   POST /drive/set-root-folder  — Limit searches to one Drive folder
+  POST /drive/index            — Sweep Drive and parse confirmations in the background
+  POST /drive/parse/{file_id}  — Parse one file as an order confirmation
+  GET  /drive/order-confirmations — List what has been parsed
 
 Follows the same pattern as seo.py: an OAuthNonce row carries CSRF state across
 the redirect, and tokens are Fernet-encrypted before they are stored.
@@ -40,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete as sa_delete
@@ -51,11 +54,113 @@ from app.core.auth import get_current_user
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.security import encrypt_token
+from app.models.brand import Brand
 from app.models.drive_connection import DriveConnection
 from app.models.oauth_nonce import NONCE_TTL, OAuthNonce
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Organisations with an index run in flight. A second run would re-download and
+# re-parse the same files, and parsing a PDF costs a Claude Vision call, so the
+# endpoint refuses rather than doubling the bill. In-process only: this guards
+# the common double-click, not a multi-worker deployment.
+_indexing_orgs: set[uuid.UUID] = set()
+
+
+async def _run_index(org_id: uuid.UUID, vendor_names: list[str], max_files: int) -> None:
+    """
+    Background sweep: find order confirmations in Drive and parse the ones that
+    are new or have changed.
+
+    Opens its own session — the request's session is closed by the time a
+    BackgroundTask runs. Every file is handled independently so one unreadable
+    document cannot stop the rest.
+    """
+    from app.core.database import async_session
+    from app.services.drive_service import (
+        download_file,
+        list_order_confirmation_candidates,
+    )
+    from app.services.order_confirmation_parser import (
+        UnsupportedFileType,
+        parse_order_confirmation,
+    )
+    from app.services.order_confirmation_store import (
+        get_cached_confirmation,
+        save_confirmation,
+    )
+
+    settings = get_settings()
+    parsed = skipped = failed = 0
+
+    try:
+        async with async_session() as db:
+            candidates = await list_order_confirmation_candidates(
+                db, org_id, vendor_names=vendor_names, max_files=max_files
+            )
+            logger.info(
+                "Drive index org=%s: %d candidate(s)", str(org_id)[:8], len(candidates)
+            )
+
+            for candidate in candidates:
+                try:
+                    cached = await get_cached_confirmation(
+                        db, org_id, candidate.file_id, candidate.modified_time
+                    )
+                    if cached is not None:
+                        skipped += 1
+                        continue
+
+                    file_bytes = await download_file(db, org_id, candidate.file_id)
+                    if not file_bytes:
+                        failed += 1
+                        continue
+
+                    result = await parse_order_confirmation(
+                        file_bytes,
+                        candidate.name,
+                        candidate.mime_type,
+                        api_key=settings.anthropic_api_key,
+                    )
+                    if not result.lines:
+                        # Nothing to match against later — do not store an empty
+                        # parse, so a corrected file gets another chance.
+                        logger.info(
+                            "Drive index: no lines in %s, not stored", candidate.name
+                        )
+                        failed += 1
+                        continue
+
+                    await save_confirmation(
+                        db,
+                        org_id,
+                        candidate.file_id,
+                        candidate.modified_time,
+                        candidate.name,
+                        result,
+                    )
+                    await db.commit()
+                    parsed += 1
+
+                except UnsupportedFileType:
+                    skipped += 1
+                except Exception as e:
+                    await db.rollback()
+                    failed += 1
+                    logger.warning(
+                        "Drive index: could not parse %s (%s): %s",
+                        candidate.name, candidate.file_id, e,
+                    )
+
+        logger.info(
+            "Drive index finished for org=%s: %d parsed, %d skipped, %d failed",
+            str(org_id)[:8], parsed, skipped, failed,
+        )
+    except Exception as e:
+        logger.error("Drive index failed for org=%s: %s", str(org_id)[:8], e, exc_info=True)
+    finally:
+        _indexing_orgs.discard(org_id)
 
 
 # Google OAuth 2.0 endpoints — same client as the Search Console flow.
@@ -407,6 +512,61 @@ async def parse_drive_file(
         "cached": False,
         "source": parsed.source,
         **serialise_confirmation(confirmation),
+    }
+
+
+@router.post("/drive/index")
+async def index_order_confirmations(
+    background_tasks: BackgroundTasks,
+    max_files: int = Query(200, ge=1, le=1000, description="Cap on files parsed per run"),
+    user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Sweep Drive for order confirmations and parse them in the background.
+
+    Importing then matches instantly against confirmations that are already
+    parsed, instead of paying for a Drive search, a download and a Claude Vision
+    call while the user waits.
+
+    Returns as soon as the sweep is queued. Progress is visible through
+    GET /drive/order-confirmations, which lists what has been parsed so far.
+    """
+    from app.services.drive_service import get_drive_connection
+
+    connection = await get_drive_connection(db, user.organisation_id)
+    if connection is None or not connection.encrypted_access_token:
+        raise HTTPException(status_code=400, detail="Google Drive er ikke forbundet")
+
+    org_id = user.organisation_id
+    if org_id in _indexing_orgs:
+        return {
+            "status": "already_running",
+            "detail": "En indeksering kører allerede for denne organisation",
+        }
+
+    # Brand names help find files a supplier named after itself and the season
+    # rather than using the word "order confirmation" at all.
+    brands_result = await db.execute(
+        select(Brand.name).where(
+            Brand.organisation_id == org_id,
+            Brand.is_active == True,  # noqa: E712 — SQLAlchemy needs the comparison
+        )
+    )
+    vendor_names = [row[0] for row in brands_result.all() if row[0]]
+
+    _indexing_orgs.add(org_id)
+    background_tasks.add_task(_run_index, org_id, vendor_names, max_files)
+
+    logger.info(
+        "Queued Drive index for org=%s (%d brand name(s), max %d files)",
+        str(org_id)[:8], len(vendor_names), max_files,
+    )
+    return {
+        "status": "started",
+        "brands_used": len(vendor_names),
+        "max_files": max_files,
+        "root_folder_id": connection.root_folder_id,
     }
 
 
