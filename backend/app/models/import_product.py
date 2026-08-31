@@ -48,6 +48,15 @@ class ImportProduct(Base):
     handle: Mapped[str] = mapped_column(String(512), default="")
     image_source: Mapped[str] = mapped_column(String(100), default="")  # which pipeline strategy found images
 
+    # Order / invoice provenance — one invoice PDF can cover several orders,
+    # so these live per product rather than only on the Import.
+    order_number: Mapped[str | None] = mapped_column(String(100))
+    invoice_number: Mapped[str | None] = mapped_column(String(100))
+
+    # Season as written on the invoice, plus the canonical form (AW26, SS27, ...)
+    season_raw: Mapped[str | None] = mapped_column(String(100))
+    season_normalized: Mapped[str | None] = mapped_column(String(20))
+
     # Pricing
     cost_price_eur: Mapped[float | None] = mapped_column(Float)
     cost_price_dkk: Mapped[float | None] = mapped_column(Float)

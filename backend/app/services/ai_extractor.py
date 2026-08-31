@@ -348,6 +348,39 @@ MATERIALE ("material"):
 - Hvis materiale fremgår af fakturaen, brug det. Hvis ikke, lad feltet være tomt "".
 - ALDRIG skriv "Ikke oplyst" — brug tom streng i stedet.
 
+ORDRENUMMER, FAKTURANUMMER OG DATO:
+Disse står i fakturaens hoved eller i blokken over hver produktlinje. Aflæs dem PRÆCIST — ciffer for ciffer.
+
+- "invoice_number" (øverste niveau): fakturanummeret fra dokumenthovedet.
+  Står typisk efter: "Facture N°", "Invoice N°", "Invoice No.", "Rechnung Nr.", "Faktura nr."
+  Eksempel: "Facture N° 26046761 du 24/04/2026" → invoice_number = "26046761"
+  Eksempel: "Invoice N° 90740886" → invoice_number = "90740886"
+
+- "invoice_date" (øverste niveau): fakturadatoen, ALTID som ISO YYYY-MM-DD.
+  Fakturaer bruger europæisk datoformat (dag først) — "24/04/2026" og "29.05.2026" er
+  24. april og 29. maj, ALDRIG omvendt.
+  Eksempel: "Facture N° 26046761 du 24/04/2026" → invoice_date = "2026-04-24"
+  Eksempel: "Invoice date 29.05.2026" → invoice_date = "2026-05-29"
+
+- "order_number" (pr. produkt): ordrenummeret som DEN ENKELTE produktlinje hører til.
+  Står typisk efter: "Commande N°", "Order N°", "Order No.", "Auftrag", "PO"
+  Eksempel: "Commande N° 2602129660 du 11/02/2026" → order_number = "2602129660"
+  Eksempel: "Order N° :" på én linje og "1000067897" på næste → order_number = "1000067897"
+  Én faktura kan dække FLERE ordrer — giv hvert produkt det ordrenummer der står i
+  netop dens blok. Hvis hele fakturaen kun har ét ordrenummer, brug det på alle produkter.
+
+- Forveksl ALDRIG ordrenummer med fakturanummer, kundenummer ("Customer N°"),
+  leveringsnummer ("BL client N°", "SH.N°"), momsnummer ("VAT N°") eller varenummer.
+- Hvis et nummer ikke findes på fakturaen: brug tom streng "". ALDRIG gæt eller opfind et nummer.
+
+SÆSON ("season"):
+- Skriv sæsonen PRÆCIST som den står på fakturaen — appen normaliserer den bagefter.
+- Står typisk efter: "Saison", "Season", "Collection".
+  Eksempel: "Saison : E26" → season = "E26"
+  Eksempel: "Season: Pre-Spring 2027" → season = "Pre-Spring 2027"
+- Oversæt eller omskriv den IKKE. Skriv "AV26" hvis der står "AV26", ikke "AW26".
+- Hvis sæsonen ikke fremgår: brug tom streng "".
+
 Brug submit_extracted_products-toolen til at returnere ALLE produkter som struktureret data.
 Hvert produkt skal have alle felter udfyldt korrekt."""
 
@@ -408,7 +441,9 @@ FAKTURA-TEKST (supplement til billederne):
                             "details_en": {"type": "string", "description": "English product description"},
                             "country_of_origin": {"type": "string", "description": "ISO country code"},
                             "hs_code": {"type": "string", "description": "HS/tariff code if available"},
-                            "season": {"type": "string", "description": "SS26, FW26, etc."},
+                            "season": {"type": "string", "description": "Season exactly as printed on the invoice, e.g. 'AV26', 'E26', 'Pre-Spring 2027'. Empty string if absent."},
+                            "order_number": {"type": "string", "description": "Order number this line belongs to (Commande N°, Order N°, etc.). Empty string if absent."},
+                            "invoice_number": {"type": "string", "description": "Invoice number this line belongs to, if the PDF covers more than one invoice. Otherwise empty string."},
                             "cost_price_eur": {"type": "number", "description": "Net unit price in EUR after discount"},
                             "discount_pct": {"type": "number", "description": "Discount percentage (0 if none)"},
                             "seo_keywords": {"type": "array", "items": {"type": "string"}, "description": "2-3 Danish search keywords based on this specific product's properties"},
@@ -427,6 +462,14 @@ FAKTURA-TEKST (supplement til billederne):
                         },
                         "required": ["style_code", "title", "vendor", "product_type", "cost_price_eur", "variants"],
                     },
+                },
+                "invoice_number": {
+                    "type": "string",
+                    "description": "Invoice number from the document header (Facture N°, Invoice N°). Empty string if absent.",
+                },
+                "invoice_date": {
+                    "type": "string",
+                    "description": "Invoice date from the document header as ISO YYYY-MM-DD. Empty string if absent.",
                 },
             },
             "required": ["products"],
@@ -467,10 +510,14 @@ FAKTURA-TEKST (supplement til billederne):
 
     # Extract structured data from tool_use response
     raw_products = None
+    ai_invoice_number = ""
+    ai_invoice_date = ""
     for block in message.content:
         if block.type == "tool_use" and block.name == "submit_extracted_products":
             tool_input = block.input
             raw_products = tool_input.get("products", [])
+            ai_invoice_number = (tool_input.get("invoice_number") or "").strip()
+            ai_invoice_date = (tool_input.get("invoice_date") or "").strip()
             break
 
     # Fallback: if tool_use didn't work (shouldn't happen with tool_choice),
@@ -635,6 +682,16 @@ FAKTURA-TEKST (supplement til billederne):
                 # Ensure color_original matches table
                 if tp["color_original"] and not p.get("color_original"):
                     p["color_original"] = tp["color_original"]
+                # Order/invoice/season read literally off the invoice text beat
+                # anything Vision inferred, so they override rather than fill in.
+                if tp.get("order_number"):
+                    p["order_number"] = tp["order_number"]
+                if tp.get("invoice_number"):
+                    p["invoice_number"] = tp["invoice_number"]
+                if tp.get("invoice_date"):
+                    p["invoice_date"] = tp["invoice_date"]
+                if tp.get("season_raw"):
+                    p["season"] = tp["season_raw"]
 
         # Check if any table products are MISSING from AI output — add them
         ai_skus = {(p.get("style_code") or "").upper() for p in raw_products}
@@ -656,13 +713,28 @@ FAKTURA-TEKST (supplement til billederne):
                     "details_en": "",
                     "country_of_origin": "",
                     "hs_code": "",
-                    "season": "",
+                    "season": tp.get("season_raw", ""),
+                    "order_number": tp.get("order_number", ""),
+                    "invoice_number": tp.get("invoice_number", ""),
+                    "invoice_date": tp.get("invoice_date", ""),
                     "cost_price_eur": tp["cost_price_eur"],
                     "ai_tags": [],
                     "variants": tp["variants"],
                 })
 
     for p in raw_products:
+        # -- Order / invoice provenance --
+        # Deterministic table data (set below by the caller-supplied table_products
+        # merge) wins over the AI value; the invoice header fills any remaining gap.
+        p["order_number"] = (p.get("order_number") or "").strip()
+        p["invoice_number"] = (p.get("invoice_number") or "").strip() or ai_invoice_number
+        p["invoice_date"] = (p.get("invoice_date") or "").strip() or ai_invoice_date
+
+        # -- Season: keep what the invoice said, add the canonical form --
+        season_raw = (p.get("season") or "").strip()
+        p["season_raw"] = season_raw
+        p["season_normalized"] = normalize_season(season_raw)
+
         # -- Normalize vendor name to match brand collection --
         p["vendor"] = _normalize_vendor(p.get("vendor", ""))
 
@@ -779,6 +851,90 @@ FAKTURA-TEKST (supplement til billederne):
 # ---------------------------------------------------------------------------
 # Normalization helpers
 # ---------------------------------------------------------------------------
+
+
+# Season codes that stand alone on an invoice. Matched against the season
+# string with every non-letter stripped, so only exact hits count — "PE" must
+# not fire on "PRESPRING".
+_SEASON_EXACT_CODES = {
+    "PS": "PS",   # Pre-Spring
+    "PF": "PF",   # Pre-Fall
+    "AW": "AW",   # Autumn/Winter
+    "AV": "AW",   # seen on invoices as an Autumn/Winter code
+    "FW": "AW",   # Fall/Winter
+    "HW": "AW",   # Herbst/Winter (German)
+    "AH": "AW",   # Automne/Hiver (French)
+    "SS": "SS",   # Spring/Summer
+    "PE": "SS",   # Printemps/Été (French)
+    # Single-letter French season codes — American Vintage writes "Saison : E26"
+    "E": "SS",    # Été (summer)
+    "H": "AW",    # Hiver (winter)
+}
+
+# Word forms, checked in order. "PRE..." variants come first so that
+# "Pre-Spring" never falls through to the plain "SPRING" rule.
+_SEASON_WORD_PATTERNS = [
+    ("PRESPRING", "PS"),
+    ("PREFALL", "PF"),
+    ("PREAUTUMN", "PF"),
+    ("RESORT", "PF"),
+    ("CRUISE", "PF"),
+    ("FALLWINTER", "AW"),
+    ("AUTUMNWINTER", "AW"),
+    ("HERBSTWINTER", "AW"),
+    ("AUTOMNEHIVER", "AW"),
+    ("SPRINGSUMMER", "SS"),
+    ("PRINTEMPSETE", "SS"),
+    ("AUTUMN", "AW"),
+    ("WINTER", "AW"),
+    ("FALL", "AW"),
+    ("SPRING", "SS"),
+    ("SUMMER", "SS"),
+]
+
+_SEASON_YEAR_RE = re.compile(r"(?:19|20)(\d{2})(?!\d)|(?<!\d)(\d{2})(?!\d)")
+
+
+def normalize_season(raw: str) -> str:
+    """
+    Map a season string from an invoice to a canonical "<CODE><YY>" form.
+
+        "AV26" / "FW26" / "Fall/Winter 2026" / "Autumn/Winter 26"  -> "AW26"
+        "SS27" / "Spring/Summer 2027" / "S/S 27"                   -> "SS27"
+        "Pre-Spring 2027" / "PS27"                                 -> "PS27"
+        "Pre-Fall 2026" / "PF26" / "Resort 2026"                   -> "PF26"
+
+    Returns "" when the season or the year cannot be determined, so callers
+    can fall back to the raw value rather than store a wrong guess.
+    """
+    if not raw:
+        return ""
+
+    # Strip everything but letters and digits: "Spring/Summer 2027" -> "SPRINGSUMMER2027"
+    compact = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+    if not compact:
+        return ""
+
+    year_match = _SEASON_YEAR_RE.search(compact)
+    if not year_match:
+        return ""
+    year = year_match.group(1) or year_match.group(2)
+
+    letters = re.sub(r"[^A-Z]", "", compact)
+    if not letters:
+        return ""
+
+    code = _SEASON_EXACT_CODES.get(letters)
+    if code is None:
+        for pattern, mapped in _SEASON_WORD_PATTERNS:
+            if pattern in letters:
+                code = mapped
+                break
+
+    if code is None:
+        return ""
+
+    return f"{code}{year}"
 
 
 def _fix_size_label(size: str) -> str:
