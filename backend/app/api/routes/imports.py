@@ -114,11 +114,12 @@ async def _load_order_confirmation_lines(db, org_id, candidate):
         candidate.mime_type,
         api_key=settings.anthropic_api_key,
     )
-    confirmation = await save_confirmation(
+    # Use the lines save_confirmation hands back. Reading confirmation.lines
+    # here would lazy-load an unpopulated relationship and raise MissingGreenlet.
+    confirmation, lines = await save_confirmation(
         db, org_id, candidate.file_id, candidate.modified_time, candidate.name, parsed
     )
-    await db.flush()
-    return confirmation, list(confirmation.lines)
+    return confirmation, lines
 
 
 async def _match_order_confirmations(db, imp, products: list[dict], sid: str) -> dict:
@@ -212,7 +213,11 @@ async def _match_order_confirmations(db, imp, products: list[dict], sid: str) ->
             if proxy is None:
                 continue
             merge_with_order_data(
-                proxy, grouped_lines.get(match.product_id, []), match=match
+                proxy,
+                grouped_lines.get(match.product_id, []),
+                match=match,
+                currency=(confirmation.currency if confirmation else None),
+                eur_rate=imp.eur_rate,
             )
 
         matched_total += len(matches)
@@ -701,7 +706,6 @@ async def _run_analysis(import_id: uuid.UUID):
 
             total_files = len(import_files_data)
             all_products: list[dict] = []
-            order_confirmations_found = 0
 
             # Pre-load brand extraction examples for few-shot AI prompting
             _brand_extraction_examples: dict[str, list[dict]] = {}
@@ -923,11 +927,28 @@ async def _run_analysis(import_id: uuid.UUID):
                     # is missing or parsing fails, the import must still finish
                     # on invoice data alone. Products simply stay unmatched.
                     try:
+                        # GET /imports/{id} derives the per-import total from
+                        # the saved products, so the count is logged rather than
+                        # accumulated into a variable nothing reads.
                         match_stats = await _match_order_confirmations(
                             db, imp, ai_products, sid
                         )
-                        order_confirmations_found += match_stats["confirmations_found"]
+                        logger.info(
+                            f"Order confirmations for {fname}: "
+                            f"{match_stats['confirmations_found']} found, "
+                            f"{match_stats['matched']}/{match_stats['total']} products matched"
+                        )
                     except Exception as oc_err:
+                        # Roll back before continuing. This step writes through
+                        # the same session as the rest of the analysis, so a DB
+                        # error leaves the transaction in a failed state and
+                        # every later statement — including saving the products
+                        # — would die with PendingRollbackError, failing the
+                        # whole import that this handler promises to protect.
+                        try:
+                            await db.rollback()
+                        except Exception:
+                            pass
                         logger.warning(
                             f"Order confirmation matching failed for {fname}: {oc_err}",
                             exc_info=True,
@@ -946,7 +967,14 @@ async def _run_analysis(import_id: uuid.UUID):
                     # ── Pass A: Synchronous enrichment (instant, no I/O) ──
                     for p in ai_products:
                         cost_eur = p.get("cost_price_eur", 0) or 0
-                        if cost_eur > 0 and (imp.eur_rate or 0) > 0:
+                        # An RRP from the order confirmation is the real retail
+                        # price; cost x rate x markup is only an estimate of it.
+                        # Step 4c runs before this, so without the guard the
+                        # estimate would overwrite the real figure.
+                        rrp_sourced = (
+                            (p.get("data_sources") or {}).get("rrp") == "order_confirmation"
+                        )
+                        if not rrp_sourced and cost_eur > 0 and (imp.eur_rate or 0) > 0:
                             vendor_lower = (p.get("vendor") or "").strip().lower()
                             product_markup = vendor_markup_map.get(vendor_lower, imp.markup)
                             p["retail_price_dkk"] = calculate_retail_price(
@@ -1681,7 +1709,11 @@ async def link_order_confirmation(
         if product is None:
             continue
         merge_with_order_data(
-            product, grouped_lines.get(match.product_id, []), match=match
+            product,
+            grouped_lines.get(match.product_id, []),
+            match=match,
+            currency=(confirmation.currency if confirmation else None),
+            eur_rate=imp.eur_rate,
         )
 
     await db.commit()

@@ -689,3 +689,60 @@ class TestTokenRefreshTransaction:
         assert await ds.get_valid_access_token(session, uuid.uuid4()) == "live-token"
         assert session.flushes == 0
         assert session.commits == 0
+
+
+# ═══════════════════════════════════════════════
+# Invoice exclusion — regression from the review
+# ═══════════════════════════════════════════════
+
+class TestInvoiceExclusion:
+    @pytest.mark.parametrize(
+        "name",
+        ["Faktura 26046761.pdf", "Invoice 90740886.pdf", "Facture 123.pdf",
+         "Rechnung 4711.pdf", "Packing list.pdf"],
+    )
+    def test_invoices_are_recognised(self, name):
+        assert ds.looks_like_invoice(name)
+
+    def test_a_file_that_says_both_is_kept(self):
+        assert not ds.looks_like_invoice("Invoice and order confirmation.pdf")
+
+    @pytest.mark.parametrize("name", ["Order Confirmation.pdf", "Marni AW26.xlsx", ""])
+    def test_confirmations_are_not_excluded(self, name):
+        assert not ds.looks_like_invoice(name)
+
+    async def test_the_invoice_cannot_match_itself_as_its_confirmation(
+        self, monkeypatch, org_id
+    ):
+        """
+        The order-number query is a full-text search, so the invoice being
+        imported matches it at the top score and would be parsed as its own
+        order confirmation.
+        """
+        files = FakeFiles(list_results=[
+            {"files": [drive_file("inv", "Faktura 26046761.pdf")]},
+            {"files": [drive_file("oc", "Order Confirmation AW26.pdf")]},
+        ])
+        _patch_connected(monkeypatch, files, connection=_FakeConnection())
+
+        result = await ds.search_order_confirmations(
+            None, org_id, vendor_name="American Vintage",
+            order_number="26046761", season="AW26",
+        )
+        assert [c.file_id for c in result] == ["oc"]
+
+
+class TestSeasonVocabularyIsShared:
+    def test_french_seasons_expand_for_the_filename_search(self):
+        """
+        ai_extractor knew "Automne/Hiver" and this module did not, so a French
+        confirmation normalised to AW26 but was never searched for as AW26.
+        """
+        variants = ds.season_search_variants("Automne/Hiver 2026")
+        assert "AW26" in variants
+        assert "FW26" in variants
+
+    def test_the_tables_are_the_same_objects(self):
+        from app.services import ai_extractor as ax
+        assert ds._SEASON_EXACT_FAMILY is ax._SEASON_EXACT_CODES
+        assert ds._SEASON_FAMILY_WORDS is ax._SEASON_WORD_PATTERNS

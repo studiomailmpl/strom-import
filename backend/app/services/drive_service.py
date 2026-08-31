@@ -66,6 +66,22 @@ FILE_FIELDS = "files(id, name, mimeType, modifiedTime, webViewLink, size)"
 INDEX_PAGE_SIZE = 100
 INDEX_FILE_FIELDS = f"nextPageToken, {FILE_FIELDS}"
 
+# Names that mark a file as an invoice rather than a confirmation. The invoice
+# being imported often lives in the same Drive and matches
+# "fullText contains '<order number>'" — the top-scoring query — so without this
+# it would be picked as its own order confirmation.
+INVOICE_NAME_HINTS = (
+    "faktura",
+    "invoice",
+    "facture",
+    "rechnung",
+    "fattura",
+    "credit note",
+    "kreditnota",
+    "packing list",
+    "følgeseddel",
+)
+
 # Words that mark a file as an order confirmation, across the languages our
 # suppliers write in. Matched against the filename only — Drive's "name
 # contains" is cheap, whereas fullText search would drag in every invoice.
@@ -209,29 +225,15 @@ _SEASON_WORD_FORMS = {
 }
 
 # Checked in order — "PRESPRING" must not fall through to the "SPRING" rule.
-_SEASON_FAMILY_WORDS = (
-    ("PRESPRING", "PS"),
-    ("PREFALL", "PF"),
-    ("PREAUTUMN", "PF"),
-    ("RESORT", "PF"),
-    ("CRUISE", "PF"),
-    ("FALLWINTER", "AW"),
-    ("AUTUMNWINTER", "AW"),
-    ("HERBSTWINTER", "AW"),
-    ("SPRINGSUMMER", "SS"),
-    ("AUTUMN", "AW"),
-    ("WINTER", "AW"),
-    ("FALL", "AW"),
-    ("SPRING", "SS"),
-    ("SUMMER", "SS"),
+# The season vocabulary lives in ai_extractor, which normalises seasons for
+# storage. Importing it rather than keeping a second copy: the two had already
+# diverged — ai_extractor knew "AUTOMNEHIVER" and "PRINTEMPSETE" and this did
+# not, so a French confirmation normalised to AW26 but its filename was never
+# searched for the AW26/FW26/AV26 variants.
+from app.services.ai_extractor import (  # noqa: E402
+    _SEASON_EXACT_CODES as _SEASON_EXACT_FAMILY,
+    _SEASON_WORD_PATTERNS as _SEASON_FAMILY_WORDS,
 )
-
-_SEASON_EXACT_FAMILY = {
-    "AW": "AW", "AV": "AW", "FW": "AW", "AH": "AW", "HW": "AW",
-    "SS": "SS", "PE": "SS",
-    "PS": "PS", "PF": "PF",
-    "E": "SS", "H": "AW",
-}
 
 _YEAR_RE = re.compile(r"(?:19|20)(\d{2})(?!\d)|(?<!\d)(\d{2})(?!\d)")
 
@@ -491,6 +493,17 @@ async def search_order_confirmations(
     client = build_drive_client(access_token)
     candidates = await asyncio.to_thread(_run_ranked_queries, client, queries)
 
+    # Drop anything that names itself an invoice. The order-number query is a
+    # full-text search, so the invoice being imported matches it at the highest
+    # score and would be parsed as its own confirmation.
+    kept = [c for c in candidates if not looks_like_invoice(c.name)]
+    if len(kept) != len(candidates):
+        logger.info(
+            "Drive search for org=%s: skipped %d invoice-looking file(s)",
+            org_id, len(candidates) - len(kept),
+        )
+    candidates = kept
+
     logger.info(
         "Drive search for org=%s vendor=%r found %d candidate(s)",
         org_id, vendor_name, len(candidates),
@@ -521,6 +534,21 @@ def _download_sync(client, file_id: str) -> bytes:
 # ═══════════════════════════════════════════════
 # Indexing — find every order confirmation up front
 # ═══════════════════════════════════════════════
+
+def looks_like_invoice(name: str) -> bool:
+    """
+    Whether a filename names an invoice rather than an order confirmation.
+
+    A file that says both — "Invoice and order confirmation.pdf" — is not
+    excluded; the confirmation wording wins.
+    """
+    if not name:
+        return False
+    lowered = name.casefold()
+    if any(hint in lowered for hint in ORDER_CONFIRMATION_NAME_HINTS):
+        return False
+    return any(hint in lowered for hint in INVOICE_NAME_HINTS)
+
 
 def looks_like_order_confirmation(name: str, vendor_names: list[str] | None = None) -> bool:
     """

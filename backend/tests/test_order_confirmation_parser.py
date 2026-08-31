@@ -418,3 +418,47 @@ def test_parsed_confirmation_serialises_for_an_api_response():
     assert payload["source"] == "xlsx"
     assert payload["lines"][0]["rrp"] == 99.0
     assert payload["lines"][0]["style_number"] == "A"
+
+
+# ═══════════════════════════════════════════════
+# Header metadata — regressions from the review
+# ═══════════════════════════════════════════════
+
+class TestHeaderMetadataRegressions:
+    @pytest.mark.parametrize(
+        "heading",
+        ["ORDER CONFIRMATION", "Order Confirmation", "Auftragsbestätigung",
+         "Ordrebekræftelse", "Commande"],
+    )
+    def test_a_document_title_is_not_read_as_an_order_number(self, heading):
+        """
+        "ORDER CONFIRMATION" used to yield order_number="CONFIRMATION" and
+        "Auftragsbestätigung 4711" yielded "sbest".
+        """
+        rows = [[heading], [], STANDARD_HEADER,
+                ["A", "n", "c", "col", "M", 1, "1,00", "2,00", ""]]
+        assert ocp._parse_rows(rows, "xlsx").order_number == ""
+
+    def test_a_real_order_number_beside_the_title_is_still_found(self):
+        rows = [["ORDER CONFIRMATION"], ["Order No: 25VA051691"], STANDARD_HEADER,
+                ["A", "n", "c", "col", "M", 1, "1,00", "2,00", ""]]
+        assert ocp._parse_rows(rows, "xlsx").order_number == "25VA051691"
+
+    def test_a_number_after_a_german_heading_is_found(self):
+        rows = [["Auftragsbestätigung 4711"], STANDARD_HEADER,
+                ["A", "n", "c", "col", "M", 1, "1,00", "2,00", ""]]
+        assert ocp._parse_rows(rows, "xlsx").order_number == "4711"
+
+    def test_a_header_on_row_zero_does_not_scrape_product_rows(self):
+        """
+        A plain CSV export puts the header on row 0. The metadata scan used to
+        fall back to 15 rows there and read order numbers out of product data.
+        """
+        rows = [STANDARD_HEADER] + [
+            [f"ORDER-{i}999", "Shirt", "c", "col", "M", 1, "1,00", "2,00", ""]
+            for i in range(5)
+        ]
+        result = ocp._parse_rows(rows, "csv")
+        assert result.order_number == ""
+        assert result.season == ""
+        assert len(result.lines) == 5, "the product rows are still parsed"

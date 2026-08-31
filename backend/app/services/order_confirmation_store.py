@@ -64,12 +64,17 @@ async def save_confirmation(
     drive_modified_time: str | None,
     file_name: str,
     parsed: ParsedOrderConfirmation,
-) -> OrderConfirmation:
+) -> tuple[OrderConfirmation, list[OrderConfirmationLine]]:
     """
     Store a parse, replacing any previous one for the same Drive file.
 
     The row is reused rather than recreated so its id stays stable for anything
     already referencing it; the lines are replaced wholesale.
+
+    Returns the confirmation *and* the line rows. Callers must use the returned
+    list rather than reading `confirmation.lines`: the relationship was never
+    populated here, so touching it emits a lazy SELECT, which raises
+    MissingGreenlet on an AsyncSession.
     """
     result = await db.execute(
         select(OrderConfirmation).where(
@@ -102,11 +107,12 @@ async def save_confirmation(
     confirmation.currency = parsed.currency or None
     confirmation.line_count = len(parsed.lines)
 
-    for line in parsed.lines:
-        db.add(_to_model(confirmation.id, line))
+    line_models = [_to_model(confirmation.id, line) for line in parsed.lines]
+    for model in line_models:
+        db.add(model)
 
     await db.flush()
-    return confirmation
+    return confirmation, line_models
 
 
 def _to_model(
@@ -128,9 +134,18 @@ def _to_model(
 
 
 def serialise_confirmation(
-    confirmation: OrderConfirmation, include_lines: bool = True
+    confirmation: OrderConfirmation,
+    include_lines: bool = True,
+    lines: list[OrderConfirmationLine] | None = None,
 ) -> dict:
-    """Shape an OrderConfirmation for an API response."""
+    """
+    Shape an OrderConfirmation for an API response.
+
+    Pass `lines` explicitly for a confirmation that was just saved — its
+    relationship is unloaded, and reading it would lazy-load under async.
+    Omit it only when the confirmation came from get_cached_confirmation, which
+    eager-loads the collection.
+    """
     payload = {
         "id": str(confirmation.id),
         "drive_file_id": confirmation.drive_file_id,
@@ -144,6 +159,7 @@ def serialise_confirmation(
         "parsed_at": confirmation.parsed_at.isoformat() if confirmation.parsed_at else None,
     }
     if include_lines:
+        line_rows = lines if lines is not None else confirmation.lines
         payload["lines"] = [
             {
                 "style_number": line.style_number,
@@ -157,6 +173,6 @@ def serialise_confirmation(
                 "wholesale_price": line.wholesale_price,
                 "rrp": line.rrp,
             }
-            for line in confirmation.lines
+            for line in line_rows
         ]
     return payload

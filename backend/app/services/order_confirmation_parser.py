@@ -263,7 +263,10 @@ def _header_metadata(rows: list[list], header_index: int) -> dict:
     table, where confirmations usually print them.
     """
     text_parts: list[str] = []
-    for row in rows[: header_index if header_index > 0 else HEADER_SCAN_ROWS]:
+    # Everything above the header row. A header on row 0 correctly yields
+    # nothing — falling back to a 15-row scan there would read product rows
+    # and scrape the order number out of product descriptions.
+    for row in rows[:header_index]:
         for cell in row:
             value = _cell_text(cell)
             if value:
@@ -272,9 +275,12 @@ def _header_metadata(rows: list[list], header_index: int) -> dict:
 
     meta = {"order_number": "", "season": "", "currency": ""}
 
+    # The captured value must contain a digit, or the heading "ORDER
+    # CONFIRMATION" yields order_number="CONFIRMATION" and
+    # "Auftragsbestätigung 4711" yields "sbest".
     order_match = re.search(
-        r"(?:order|ordre|commande|auftrag)\s*(?:no\.?|nr\.?|number|n[o°])?\s*[:#]?\s*"
-        r"([A-Z0-9][A-Z0-9/-]{3,})",
+        r"(?:order|ordre|commande|auftrag)\w*\s*(?:no\.?|nr\.?|number|n[o°])?\s*[:#]?\s*"
+        r"(?=[A-Z0-9/-]*\d)([A-Z0-9][A-Z0-9/-]{3,})",
         blob, re.IGNORECASE,
     )
     if order_match:

@@ -30,6 +30,7 @@ def product(**kwargs) -> ImportProduct:
         "season": "",
         "variants": [],
         "cost_price_eur": None,
+        "retail_price_dkk": None,
         "images": [],
         "description_da": "",
         "qa_warnings": [],
@@ -342,11 +343,36 @@ class TestMergeWithOrderData:
         outcome = om.merge_with_order_data(p, [line(style_number="A", wholesale_price=99.0)])
         assert outcome.warnings == []
 
-    def test_rrp_is_recorded_as_coming_from_the_confirmation(self):
+    def test_rrp_becomes_the_retail_price(self):
+        """The confirmation's RRP is the real retail price, not an estimate."""
         p = product()
         lines = [line(style_number="A", size="M", rrp=499.0)]
-        outcome = om.merge_with_order_data(p, lines)
+        outcome = om.merge_with_order_data(p, lines, currency="DKK", eur_rate=7.46)
+
+        assert p.retail_price_dkk == 499.0
         assert outcome.data_sources["rrp"] == om.SOURCE_ORDER_CONFIRMATION
+
+    def test_a_eur_rrp_is_converted(self):
+        p = product()
+        lines = [line(style_number="A", size="M", rrp=100.0)]
+        om.merge_with_order_data(p, lines, currency="EUR", eur_rate=7.46)
+        assert p.retail_price_dkk == pytest.approx(746.0)
+
+    def test_an_unconvertible_rrp_claims_nothing(self):
+        """Provenance must not be claimed for a value that was never applied."""
+        p = product(retail_price_dkk=1234.0)
+        lines = [line(style_number="A", size="M", rrp=499.0)]
+        outcome = om.merge_with_order_data(p, lines, currency="JPY", eur_rate=7.46)
+
+        assert p.retail_price_dkk == 1234.0, "the calculated price stands"
+        assert "rrp" not in outcome.data_sources
+
+    def test_no_currency_means_no_conversion(self):
+        p = product(retail_price_dkk=1234.0)
+        lines = [line(style_number="A", size="M", rrp=499.0)]
+        outcome = om.merge_with_order_data(p, lines)
+        assert p.retail_price_dkk == 1234.0
+        assert "rrp" not in outcome.data_sources
 
     def test_match_bookkeeping_is_written_to_the_product(self):
         p = product()
@@ -415,7 +441,9 @@ class TestGroupLinesByMatch:
 
         matches = om.match_products_to_order_lines([p], sizes)
         grouped = om.group_lines_by_match(matches, sizes)
-        outcome = om.merge_with_order_data(p, grouped[p.id], match=matches[0])
+        outcome = om.merge_with_order_data(
+            p, grouped[p.id], match=matches[0], currency="DKK", eur_rate=7.46
+        )
 
         assert p.title == "Mello Knit Shirt"
         assert p.match_confidence == 90  # "abc-123" vs "ABC123" is a normalised match
@@ -483,7 +511,9 @@ class TestProductProxy:
 
         matches = om.match_products_to_order_lines([proxy], sizes)
         grouped = om.group_lines_by_match(matches, sizes)
-        om.merge_with_order_data(proxy, grouped[proxy.id], match=matches[0])
+        om.merge_with_order_data(
+            proxy, grouped[proxy.id], match=matches[0], currency="DKK", eur_rate=7.46
+        )
 
         # Everything lands in the plain dict the pipeline will save from.
         assert data["title"] == "Mello Knit Shirt"

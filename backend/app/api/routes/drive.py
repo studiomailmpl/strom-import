@@ -143,7 +143,7 @@ async def _run_index(org_id: uuid.UUID, vendor_names: list[str], max_files: int)
                         candidate.modified_time,
                         candidate.name,
                         result,
-                    )
+                    )  # returns (confirmation, lines); neither is needed here
                     await db.commit()
                     parsed += 1
 
@@ -503,7 +503,7 @@ async def parse_drive_file(
     except ValueError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    confirmation = await save_confirmation(
+    confirmation, lines = await save_confirmation(
         db, user.organisation_id, file_id, modified_time, file_name, parsed
     )
     await db.commit()
@@ -515,7 +515,9 @@ async def parse_drive_file(
     return {
         "cached": False,
         "source": parsed.source,
-        **serialise_confirmation(confirmation),
+        # Pass the lines explicitly — the freshly saved confirmation's
+        # relationship is unloaded and would lazy-load under async.
+        **serialise_confirmation(confirmation, lines=lines),
     }
 
 

@@ -239,19 +239,47 @@ def score_pair(
 
 
 def _same_vendor_and_season(product, vendor: str | None, season: str | None) -> bool:
-    """Fuzzy matching is only allowed within one vendor and season."""
+    """
+    Fuzzy matching is only allowed within one vendor and season.
+
+    Both sides are normalised first. The confirmation stores what was printed —
+    "E26", "American Vintage SAS" — while the product carries the pipeline's
+    normalised values — "SS26", "American Vintage". Comparing them raw fails on
+    realistic data and silently switches fuzzy matching off, which is exactly
+    the case it exists for.
+    """
+    from app.services.ai_extractor import normalize_season
+
     if vendor:
         product_vendor = (getattr(product, "vendor", "") or "").strip().casefold()
-        if product_vendor and product_vendor != vendor.strip().casefold():
-            return False
+        confirmation_vendor = vendor.strip().casefold()
+        if product_vendor and confirmation_vendor:
+            # A supplier's legal name often extends the brand name
+            # ("American Vintage SAS"), so accept either containing the other.
+            if not (
+                product_vendor == confirmation_vendor
+                or product_vendor in confirmation_vendor
+                or confirmation_vendor in product_vendor
+            ):
+                return False
+
     if season:
         product_season = (
             getattr(product, "season_normalized", None)
             or getattr(product, "season", None)
             or ""
-        ).strip().casefold()
-        if product_season and product_season != season.strip().casefold():
-            return False
+        ).strip()
+        confirmation_season = season.strip()
+        if product_season and confirmation_season:
+            # Compare canonical forms, falling back to the raw text for a season
+            # neither side can normalise.
+            product_canonical = normalize_season(product_season) or product_season.casefold()
+            confirmation_canonical = (
+                normalize_season(confirmation_season) or confirmation_season.casefold()
+            )
+            if product_canonical != confirmation_canonical:
+                return False
+
     return True
 
 
@@ -377,11 +405,28 @@ def _cost_deviates(invoice_cost: float | None, order_cost: float | None) -> floa
     return abs(invoice_cost - order_cost) / denominator
 
 
+def _rrp_to_dkk(rrp: float, currency: str | None, eur_rate: float | None) -> float | None:
+    """
+    Convert a confirmation's RRP to DKK, or None when it cannot be done safely.
+
+    Confirmations quote in their own currency. DKK needs no conversion; EUR
+    needs the import's rate. Anything else is left alone rather than guessed.
+    """
+    code = (currency or "").strip().upper()
+    if code == "DKK":
+        return round(rrp, 2)
+    if code == "EUR" and eur_rate and eur_rate > 0:
+        return round(rrp * eur_rate, 2)
+    return None
+
+
 def merge_with_order_data(
     product,
     order_lines: list,
     *,
     match: MatchResult | None = None,
+    currency: str | None = None,
+    eur_rate: float | None = None,
 ) -> MergeOutcome:
     """
     Apply the merge policy to one product, in place.
@@ -397,6 +442,10 @@ def merge_with_order_data(
 
     A cost difference above 2% between the two sources is reported as a QA
     warning rather than silently resolved.
+
+    `currency` and `eur_rate` are needed to apply the RRP: it is quoted in the
+    confirmation's currency and stored in DKK. Without them the RRP is skipped
+    and the calculated retail price stands.
     """
     outcome = MergeOutcome()
     if not order_lines:
@@ -459,9 +508,22 @@ def merge_with_order_data(
     if order_cost is not None:
         _apply("cost_price_eur", order_cost)
 
-    # RRP is why the confirmation is read at all — the invoice never carries one.
+    # RRP is why the confirmation is read at all — the invoice never carries one,
+    # so it beats the cost x rate x markup estimate the enrichment step computes.
+    # Only claim provenance when the value is actually applied: without a
+    # currency we cannot convert, and a wrong retail price is worse than an
+    # estimated one.
     if primary.rrp is not None:
-        outcome.data_sources["rrp"] = SOURCE_ORDER_CONFIRMATION
+        retail_dkk = _rrp_to_dkk(primary.rrp, currency, eur_rate)
+        if retail_dkk is not None:
+            _apply("retail_price_dkk", retail_dkk)
+            outcome.data_sources["rrp"] = SOURCE_ORDER_CONFIRMATION
+        else:
+            logger.info(
+                "RRP %.2f present but currency %r cannot be converted — "
+                "leaving the calculated retail price in place",
+                primary.rrp, currency,
+            )
 
     # ── Images and descriptions stay with the scraper ──
     if getattr(product, "images", None):

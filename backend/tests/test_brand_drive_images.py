@@ -101,6 +101,16 @@ class TestFetchBrandDriveImages:
         assert all(u.startswith("https://api.example.test/api/v1/images/drive/") for u in urls)
         assert len(urls) == 2
 
+        # The URL must match a route that actually exists, or every packshot is
+        # a dead link and the product reaches Shopify with no images.
+        from app.main import app
+        paths = {r.path for r in app.routes if hasattr(r, "path")}
+        assert "/api/v1/images/drive/{vendor}/{sku}/{filename}" in paths
+        segments = urls[0].split("/api/v1/images/")[1].split("/")
+        assert len(segments) == 4 and segments[0] == "drive", (
+            "the URL shape must match the route's segment count"
+        )
+
         written = sorted(p.name for p in (image_dir / "drive").rglob("*.jpg"))
         assert written == ["COHBU-M26388_1.jpg", "COHBU-M26388_2.jpg"]
         assert (image_dir / "drive" / "A.P.C." / "COHBU-M26388" / "COHBU-M26388_1.jpg").read_bytes() == b"\xff\xd8jpegone"
