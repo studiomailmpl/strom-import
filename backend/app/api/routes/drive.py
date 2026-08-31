@@ -431,7 +431,16 @@ async def set_root_folder(
     if not connection:
         raise HTTPException(status_code=404, detail="Google Drive er ikke forbundet")
 
-    connection.root_folder_id = body.root_folder_id.strip() or None
+    # Accept a pasted Drive URL as well as a bare id.
+    from app.services.drive_service import normalise_folder_id
+
+    submitted = body.root_folder_id.strip()
+    if submitted and not normalise_folder_id(submitted):
+        raise HTTPException(
+            status_code=400,
+            detail="Kunne ikke læse et mappe-ID. Indsæt mappens URL fra Drive eller selve ID'et.",
+        )
+    connection.root_folder_id = normalise_folder_id(submitted) or None
     await db.commit()
 
     return DriveStatusResponse(

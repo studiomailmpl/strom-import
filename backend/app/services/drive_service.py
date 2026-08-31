@@ -313,6 +313,41 @@ class DriveCandidate:
         }
 
 
+_FOLDER_URL_RE = re.compile(r"/folders/([A-Za-z0-9_-]{10,})")
+_FOLDER_OPEN_RE = re.compile(r"[?&]id=([A-Za-z0-9_-]{10,})")
+
+
+def normalise_folder_id(value: str | None) -> str:
+    """
+    Accept either a Drive folder ID or the URL people actually copy.
+
+    Right-clicking a folder in Drive gives a link, not an ID, so that is what
+    lands in the field. Passing a URL to Drive's "'<id>' in parents" matches
+    nothing and returns zero results without an error, so normalise on the way
+    in and on the way out.
+
+        "https://drive.google.com/drive/folders/1P4k...?usp=drive_link" -> "1P4k..."
+        "https://drive.google.com/open?id=1P4k..."                      -> "1P4k..."
+        "1P4k..."                                                       -> "1P4k..."
+    """
+    if not value:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    match = _FOLDER_URL_RE.search(text) or _FOLDER_OPEN_RE.search(text)
+    if match:
+        return match.group(1)
+
+    # Not a URL — treat as a bare id, but refuse anything with URL punctuation
+    # so a malformed link cannot silently become a nonsense query.
+    if "/" in text or "?" in text or " " in text:
+        logger.warning("Unrecognised Drive folder reference: %r", text[:80])
+        return ""
+    return text
+
+
 def _escape_query_value(value: str) -> str:
     """
     Escape a value for a Drive query string literal.
@@ -331,8 +366,11 @@ def _wrap_query(clause: str, root_folder_id: str | None) -> str:
     """Add the constraints every search shares: not trashed, right file type,
     and — when the organisation set one — inside the configured root folder."""
     parts = [f"({clause})", "trashed = false", _mime_clause()]
-    if root_folder_id:
-        parts.append(f"'{_escape_query_value(root_folder_id)}' in parents")
+    # Normalise here too, not just on write: a connection saved before this
+    # existed may still hold a pasted URL.
+    folder_id = normalise_folder_id(root_folder_id)
+    if folder_id:
+        parts.append(f"'{_escape_query_value(folder_id)}' in parents")
     return " and ".join(parts)
 
 

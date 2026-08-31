@@ -551,13 +551,13 @@ function SettingsPageInner() {
 
             <div className="mb-3">
               <label className="mb-1 block text-[11px] font-medium" style={{ color: "var(--text-secondary)" }}>
-                Rodmappe-ID (valgfrit)
+                Rodmappe (valgfrit)
               </label>
               <input
                 type="text"
                 value={rootFolder}
                 onChange={(e) => setRootFolder(e.target.value)}
-                placeholder="fx 1QWf2LGX7ehmMMO0YdEwsmxfI9tUOR8VE"
+                placeholder="Indsæt mappens link fra Drive"
                 className="w-full rounded-[var(--radius-md)] px-3 py-2 text-[13px]"
                 style={{
                   background: "var(--bg-primary)",
@@ -567,8 +567,9 @@ function SettingsPageInner() {
                 }}
               />
               <p className="mt-1 text-[11px]" style={{ color: "var(--text-tertiary)" }}>
-                Begrænser søgningen til én mappe. ID&apos;et er den sidste del af mappens
-                URL i Drive. Lad feltet stå tomt for at gennemsøge hele drevet.
+                Begrænser søgningen til én mappe. Højreklik mappen i Drive → Del →
+                Kopiér link, og indsæt det her; mappe-ID&apos;et udtrækkes automatisk.
+                Lad feltet stå tomt for at gennemsøge hele drevet.
               </p>
             </div>
 

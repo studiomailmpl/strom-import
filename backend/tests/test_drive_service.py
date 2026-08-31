@@ -746,3 +746,50 @@ class TestSeasonVocabularyIsShared:
         from app.services import ai_extractor as ax
         assert ds._SEASON_EXACT_FAMILY is ax._SEASON_EXACT_CODES
         assert ds._SEASON_FAMILY_WORDS is ax._SEASON_WORD_PATTERNS
+
+
+# ═══════════════════════════════════════════════
+# Folder id normalisation
+# ═══════════════════════════════════════════════
+
+FOLDER_ID = "1P4kJq0OyTXu-Qi2fXww6j6Du8qT7pRK3"
+
+
+class TestNormaliseFolderId:
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            f"https://drive.google.com/drive/folders/{FOLDER_ID}?usp=drive_link",
+            f"https://drive.google.com/drive/folders/{FOLDER_ID}",
+            f"https://drive.google.com/drive/u/0/folders/{FOLDER_ID}",
+            f"https://drive.google.com/open?id={FOLDER_ID}",
+            f"  https://drive.google.com/drive/folders/{FOLDER_ID}  ",
+        ],
+    )
+    def test_extracts_the_id_from_a_pasted_link(self, raw):
+        """Right-clicking a folder in Drive gives a link, not an id."""
+        assert ds.normalise_folder_id(raw) == FOLDER_ID
+
+    def test_a_bare_id_passes_through(self):
+        assert ds.normalise_folder_id(FOLDER_ID) == FOLDER_ID
+
+    @pytest.mark.parametrize("raw", [None, "", "   "])
+    def test_empty_input_yields_empty(self, raw):
+        assert ds.normalise_folder_id(raw) == ""
+
+    def test_an_unrecognisable_url_is_rejected_rather_than_passed_through(self):
+        """A nonsense value must not become a query that silently matches nothing."""
+        assert ds.normalise_folder_id("https://example.com/some/page") == ""
+        assert ds.normalise_folder_id("not an id") == ""
+
+    def test_a_pasted_url_still_produces_a_working_query(self):
+        """The regression: a URL in the query matched nothing, with no error."""
+        url = f"https://drive.google.com/drive/folders/{FOLDER_ID}?usp=drive_link"
+        query = ds.build_index_queries(root_folder_id=url)[0]
+        assert f"'{FOLDER_ID}' in parents" in query
+        assert "drive.google.com" not in query
+
+    def test_ranked_queries_normalise_too(self):
+        url = f"https://drive.google.com/drive/folders/{FOLDER_ID}"
+        query = ds.build_ranked_queries(vendor_name="V", root_folder_id=url)[0][2]
+        assert f"'{FOLDER_ID}' in parents" in query

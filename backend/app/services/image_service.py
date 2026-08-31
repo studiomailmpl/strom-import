@@ -870,8 +870,12 @@ def fetch_brand_drive_images(
     """
     from app.services.drive_service import build_drive_client
 
+    from app.services.drive_service import normalise_folder_id
+
     settings = get_settings()
     variants = _drive_sku_variants(style_code)
+    # A brand's drive_folder_id is pasted by hand and is usually the folder URL.
+    folder_id = normalise_folder_id(folder_id)
     if not variants or not folder_id or not access_token:
         return []
 
