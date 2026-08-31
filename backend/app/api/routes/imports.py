@@ -851,6 +851,16 @@ async def _run_analysis(import_id: uuid.UUID):
                             )
 
                     # 4b. Lookup brand-specific config (markup + image scraping) for all vendors
+                    # Resolve the Drive token once per file rather than per brand:
+                    # the image search runs in a worker thread and cannot await a
+                    # token refresh, so it is handed a ready one.
+                    _drive_access_token = ""
+                    try:
+                        from app.services.drive_service import get_valid_access_token as _drive_token
+                        _drive_access_token = await _drive_token(db, imp.organisation_id) or ""
+                    except Exception as drive_token_err:
+                        logger.warning(f"Could not resolve Drive token: {drive_token_err}")
+
                     unique_vendors = {p.get("vendor", "").strip() for p in ai_products if p.get("vendor")}
                     vendor_markup_map: dict[str, float] = {}
                     vendor_image_config: dict[str, dict] = {}  # vendor_lower → {website_url, search_url_pattern}
@@ -863,6 +873,7 @@ async def _run_analysis(import_id: uuid.UUID):
                                         Brand.website_url, Brand.search_url_pattern,
                                         Brand.image_bank_url, Brand.image_bank_type,
                                         Brand.image_bank_search_pattern,
+                                        Brand.drive_folder_id,
                                     ).where(
                                         Brand.organisation_id == imp.organisation_id,
                                         Brand.is_active == True,
@@ -882,6 +893,7 @@ async def _run_analysis(import_id: uuid.UUID):
                                         or brand_row.search_url_pattern
                                         or brand_row.image_bank_url
                                         or brand_row.image_bank_search_pattern
+                                        or brand_row.drive_folder_id
                                     )
                                     if has_img_config:
                                         vendor_image_config[vendor_name.lower()] = {
@@ -890,12 +902,18 @@ async def _run_analysis(import_id: uuid.UUID):
                                             "image_bank_url": brand_row.image_bank_url or "",
                                             "image_bank_type": brand_row.image_bank_type or "",
                                             "image_bank_search_pattern": brand_row.image_bank_search_pattern or "",
+                                            "drive_folder_id": brand_row.drive_folder_id or "",
+                                            # Resolved once per import below —
+                                            # the image search runs in a worker
+                                            # thread and cannot await a refresh.
+                                            "drive_access_token": _drive_access_token or "",
                                         }
                                         logger.info(
                                             f"Brand image config for '{vendor_name}': "
                                             f"website={brand_row.website_url or 'none'}, "
                                             f"search_pattern={'yes' if brand_row.search_url_pattern else 'none'}, "
-                                            f"image_bank={'yes' if brand_row.image_bank_search_pattern else 'none'}"
+                                            f"image_bank={'yes' if brand_row.image_bank_search_pattern else 'none'}, "
+                                            f"drive_folder={'yes' if brand_row.drive_folder_id else 'none'}"
                                         )
                         except Exception as brand_err:
                             logger.warning(f"Brand config lookup failed: {brand_err}")

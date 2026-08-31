@@ -44,6 +44,14 @@ class Brand(Base):
     )
     image_bank_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Google Drive folder holding this brand's packshots. An authenticated,
+    # curated source, so it is searched before falling back to Google Images.
+    drive_folder_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True,
+        comment="Drive folder ID with this brand's product images. The last "
+                "path segment of the folder's URL in Drive.",
+    )
+
     # Pricing
     markup: Mapped[float] = mapped_column(
         Float, default=2.5, server_default="2.5",
